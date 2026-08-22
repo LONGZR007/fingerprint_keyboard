@@ -1,0 +1,10 @@
+# 编译中间产物 / 构建输出
+*.o
+*.d
+*.elf
+*.hex
+*.map
+*.lst
+*.siz
+*.253r.expand
+callgraph.dot
