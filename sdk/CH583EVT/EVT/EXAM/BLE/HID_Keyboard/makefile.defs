@@ -1,0 +1,5 @@
+# User build extensions.
+# obj/makefile already does:  -include ../makefile.defs
+# so this file is the hook for adding sources WITHOUT touching any
+# auto-generated makefile / subdir.mk.
+-include ../APP/subdir_extra.mk
