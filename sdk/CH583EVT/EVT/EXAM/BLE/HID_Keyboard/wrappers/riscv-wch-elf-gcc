@@ -1,0 +1,9 @@
+#!/bin/bash
+export COMPILER_PATH="/workspace/sdk/CH583EVT/EVT/EXAM/BLE/HID_Keyboard/wrappers:${COMPILER_PATH}"
+exec /usr/bin/riscv64-unknown-elf-gcc \
+  -I/usr/lib/picolibc/riscv64-unknown-elf/include \
+  -L/usr/lib/picolibc/riscv64-unknown-elf/lib/rv32imac/ilp32 \
+  -L/usr/lib/picolibc/riscv64-unknown-elf/lib \
+  -specs=/usr/lib/picolibc/riscv64-unknown-elf/picolibc.specs \
+  "$@" \
+  -march=rv32imac_zicsr_zifencei

@@ -3,7 +3,7 @@
  * Author             : WCH
  * Version            : V1.0
  * Date               : 2020/08/06
- * Description        : À¶ÑÀ¼üÅÌÓ¦ÓÃÖ÷º¯Êý¼°ÈÎÎñÏµÍ³³õÊ¼»¯
+ * Description        : è“ç‰™é”®ç›˜åº”ç”¨ä¸»å‡½æ•°åŠä»»åŠ¡ç³»ç»Ÿåˆå§‹åŒ–
  *********************************************************************************
  * Copyright (c) 2021 Nanjing Qinheng Microelectronics Co., Ltd.
  * Attention: This software (modified or not) and binary are used for 
@@ -11,11 +11,13 @@
  *******************************************************************************/
 
 /******************************************************************************/
-/* Í·ÎÄ¼þ°üº¬ */
+/* å¤´æ–‡ä»¶åŒ…å« */
 #include "CONFIG.h"
 #include "HAL.h"
 #include "hiddev.h"
 #include "hidkbd.h"
+#include "cli.h"
+#include "cli_uart.h"
 
 /*********************************************************************
  * GLOBAL TYPEDEFS
@@ -26,10 +28,46 @@ __attribute__((aligned(4))) uint32_t MEM_BUF[BLE_MEMHEAP_SIZE / 4];
 const uint8_t MacAddr[6] = {0x84, 0xC2, 0xE4, 0x03, 0x02, 0x02};
 #endif
 
+/* --------------------------------------------------------------------------
+ * CLI integration (TMOS task, 5 ms poll interval)
+ * ------------------------------------------------------------------------ */
+#define CLI_TASK_EVT_POLL     0x0001
+#define CLI_POLL_MS           5
+static uint8_t cli_task_id = INVALID_TASK_ID;
+extern int   cli_app_cmds_register(void);
+
+static uint16_t CliTask_ProcessEvent(uint8_t task_id, uint16_t events)
+{
+    (void)task_id;
+    if (events & CLI_TASK_EVT_POLL) {
+        /* Drain UART ring -> line edit -> run command if line ready */
+        cli_uart_drain();
+        cli_task();
+        /* re-arm the poll tick */
+        tmos_start_task(cli_task_id, CLI_TASK_EVT_POLL, CLI_POLL_MS);
+        return (uint16_t)(events ^ CLI_TASK_EVT_POLL);
+    }
+    return 0;
+}
+
+static void Cli_Init(void)
+{
+    cli_uart_init();
+    cli_init();
+    cli_app_cmds_register();
+    cli_task_id = TMOS_ProcessEventRegister(CliTask_ProcessEvent);
+    cli_print("\r\n=== CLI ready on UART%d %u 8N1 ===\r\n",
+              (int)1 /* CLI_UART_PORT */, (unsigned)CLI_UART_BAUD);
+    cli_print("Type 'help' for a list of commands.\r\n");
+    cli_print_prompt();
+    /* kick off periodic drain */
+    tmos_start_task(cli_task_id, CLI_TASK_EVT_POLL, CLI_POLL_MS);
+}
+
 /*********************************************************************
  * @fn      Main_Circulation
  *
- * @brief   Ö÷Ñ­»·
+ * @brief   ä¸»å¾ªçŽ¯
  *
  * @return  none
  */
@@ -46,7 +84,7 @@ void Main_Circulation()
 /*********************************************************************
  * @fn      main
  *
- * @brief   Ö÷º¯Êý
+ * @brief   ä¸»å‡½æ•°
  *
  * @return  none
  */
@@ -71,6 +109,7 @@ int main(void)
     GAPRole_PeripheralInit();
     HidDev_Init();
     HidEmu_Init();
+    Cli_Init();
     Main_Circulation();
 }
 

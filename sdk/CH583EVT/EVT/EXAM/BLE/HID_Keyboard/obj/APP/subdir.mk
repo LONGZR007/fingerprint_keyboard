@@ -6,15 +6,27 @@
 # Add inputs and outputs from these tool invocations to the build variables 
 C_SRCS += \
 ../APP/hidkbd.c \
-../APP/hidkbd_main.c 
+../APP/hidkbd_main.c \
+../APP/cli.c \
+../APP/cli_uart.c \
+../APP/cli_app_cmds.c \
+../APP/cli_os_compat.c 
 
 C_DEPS += \
 ./APP/hidkbd.d \
-./APP/hidkbd_main.d 
+./APP/hidkbd_main.d \
+./APP/cli.d \
+./APP/cli_uart.d \
+./APP/cli_app_cmds.d \
+./APP/cli_os_compat.d 
 
 OBJS += \
 ./APP/hidkbd.o \
-./APP/hidkbd_main.o 
+./APP/hidkbd_main.o \
+./APP/cli.o \
+./APP/cli_uart.o \
+./APP/cli_app_cmds.o \
+./APP/cli_os_compat.o 
 
 DIR_OBJS += \
 ./APP/*.o \
