@@ -10,3 +10,7 @@
 4. **gcc 包装器**：为 `riscv-wch-elf-gcc` 包一层 wrapper，自动将 `-march=rv32imac` 改写为 `rv32imac_zicsr_zifencei`（新版 GCC 需要 zicsr / zifencei 才能汇编 `csrr` / `fence.i`），并补 picolibc 的 `-isystem` / `-L` 路径。
 
 编译结果：0 error，23 warning（均为厂商代码无害告警），生成 `HID_Keyboard.elf` / `HID_Keyboard.hex`。
+
+#项目管理
+
+项目管理使用`.wvproj`文件，不能直接修改只修改`makefile`。
