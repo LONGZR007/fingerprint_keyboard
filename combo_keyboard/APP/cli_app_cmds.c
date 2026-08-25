@@ -16,6 +16,7 @@
 #include "HAL.h"
 #include "hidkbd.h"
 #include "usb_composite.h"
+#include "keyboard_dispatch.h"
 
 /* ---- tiny delay / NOP helper ------------------------------------------------ */
 #ifndef __NOP
@@ -212,7 +213,8 @@ static int cmd_type(int argc, char *argv[])
                   "           type aB3\r\n"
                   "           type hello world\r\n"
                   "           type \"passw0rd!\"\r\n"
-                  "         Note: sends via both BLE and USB HID keyboards.\r\n");
+                  "         channel: %s (use 'channel' cmd to change)\r\n",
+                  keyboard_channel_name(keyboard_get_channel()));
         return 0;
     }
     /* Rejoin argv[1..argc-1] back into one string with single spaces,
@@ -230,10 +232,34 @@ static int cmd_type(int argc, char *argv[])
     }
     s_line[n] = '\0';
 
-    int typed = hidkbd_type_text(s_line);
-    int typed_usb = usb_hid_send_text(s_line);
-    cli_print("  BLE typed %d, USB typed %d of %d: \"%s\"\r\n",
-              typed, typed_usb, n, s_line);
+    int typed = keyboard_type(s_line);
+    cli_print("  typed %d char(s) of %d via %s: \"%s\"\r\n",
+              typed, n, keyboard_channel_name(keyboard_get_channel()), s_line);
+    return 0;
+}
+
+/* --- channel ----------------------------------------------------------- */
+static int cmd_channel(int argc, char *argv[])
+{
+    if (argc < 2) {
+        cli_print("  current channel: %s\r\n"
+                  "  usage: channel <ble|usb|both>\r\n",
+                  keyboard_channel_name(keyboard_get_channel()));
+        return 0;
+    }
+    kbd_channel_t ch;
+    if (!strcmp(argv[1], "ble") || !strcmp(argv[1], "1")) {
+        ch = KBD_CH_BLE;
+    } else if (!strcmp(argv[1], "usb") || !strcmp(argv[1], "2")) {
+        ch = KBD_CH_USB;
+    } else if (!strcmp(argv[1], "both") || !strcmp(argv[1], "3")) {
+        ch = KBD_CH_BOTH;
+    } else {
+        cli_print("  invalid channel '%s'\r\n  usage: channel <ble|usb|both>\r\n", argv[1]);
+        return -1;
+    }
+    keyboard_set_channel(ch);
+    cli_print("  channel set to: %s\r\n", keyboard_channel_name(ch));
     return 0;
 }
 
@@ -245,6 +271,7 @@ static const cli_cmd_t s_app_cmds[] = {
     { "help",   cmd_help,   "list all commands" },
     { "echo",   cmd_echo,   "echo <words...>          print arguments" },
     { "type",   cmd_type,   "type <words...>          HID-type string (letters/digits/symbols)" },
+    { "channel", cmd_channel, "channel [ble|usb|both]   set HID output channel" },
     { "info",   cmd_info,   "show build / hw / BLE info" },
     { "reset",  cmd_reset,  "software reset MCU" },
     { "adv",    cmd_adv,    "adv [on|off]             control BLE advertising" },

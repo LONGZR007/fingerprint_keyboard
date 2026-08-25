@@ -4,9 +4,9 @@
 # obj/APP/subdir.mk with the same files already included.
 # Included via makefile.defs (obj/makefile line: -include ../makefile.defs).
 
-_cli_srcs := ../APP/cli.c ../APP/cli_uart.c ../APP/cli_app_cmds.c ../APP/cli_os_compat.c ../APP/usb_composite.c
-_cli_deps := ./APP/cli.d ./APP/cli_uart.d ./APP/cli_app_cmds.d ./APP/cli_os_compat.d ./APP/usb_composite.d
-_cli_objs := ./APP/cli.o ./APP/cli_uart.o ./APP/cli_app_cmds.o ./APP/cli_os_compat.o ./APP/usb_composite.o
+_cli_srcs := ../APP/cli.c ../APP/cli_uart.c ../APP/cli_app_cmds.c ../APP/cli_os_compat.c ../APP/usb_composite.c ../APP/keyboard_dispatch.c
+_cli_deps := ./APP/cli.d ./APP/cli_uart.d ./APP/cli_app_cmds.d ./APP/cli_os_compat.d ./APP/usb_composite.d ./APP/keyboard_dispatch.d
+_cli_objs := ./APP/cli.o ./APP/cli_uart.o ./APP/cli_app_cmds.o ./APP/cli_os_compat.o ./APP/usb_composite.o ./APP/keyboard_dispatch.o
 
 C_SRCS += $(filter-out $(C_SRCS),$(_cli_srcs))
 C_DEPS += $(filter-out $(C_DEPS),$(_cli_deps))
