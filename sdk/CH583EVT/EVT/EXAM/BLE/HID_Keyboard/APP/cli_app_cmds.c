@@ -202,6 +202,39 @@ static int cmd_baud(int argc, char *argv[])
     return 0;
 }
 
+/* --- type -------------------------------------------------------------- */
+static int cmd_type(int argc, char *argv[])
+{
+    if (argc < 2) {
+        cli_print("  usage: type <text...>\r\n"
+                  "         examples:\r\n"
+                  "           type aB3\r\n"
+                  "           type hello world\r\n"
+                  "           type \"passw0rd!\"\r\n"
+                  "         Note: requires BLE HID notifications enabled (host connected).\r\n");
+        return 0;
+    }
+    /* Rejoin argv[1..argc-1] back into one string with single spaces,
+     * mirroring the behaviour the user expects when they type multiple
+     * shell tokens. */
+    static char s_line[CLI_LINE_MAX];
+    int n = 0;
+    for (int i = 1; i < argc && n < (int)(sizeof(s_line) - 1); i++) {
+        if (i > 1 && n < (int)(sizeof(s_line) - 1)) {
+            s_line[n++] = ' ';
+        }
+        for (const char *p = argv[i]; *p && n < (int)(sizeof(s_line) - 1); p++) {
+            s_line[n++] = *p;
+        }
+    }
+    s_line[n] = '\0';
+
+    int typed = hidkbd_type_text(s_line);
+    cli_print("  typed %d char(s) of %d: \"%s\"\r\n",
+              typed, n, s_line);
+    return 0;
+}
+
 /* =======================================================================
  * Command table + registration entry
  * ===================================================================== */
@@ -209,6 +242,7 @@ static int cmd_baud(int argc, char *argv[])
 static const cli_cmd_t s_app_cmds[] = {
     { "help",   cmd_help,   "list all commands" },
     { "echo",   cmd_echo,   "echo <words...>          print arguments" },
+    { "type",   cmd_type,   "type <words...>          HID-type string (letters/digits/symbols)" },
     { "info",   cmd_info,   "show build / hw / BLE info" },
     { "reset",  cmd_reset,  "software reset MCU" },
     { "adv",    cmd_adv,    "adv [on|off]             control BLE advertising" },

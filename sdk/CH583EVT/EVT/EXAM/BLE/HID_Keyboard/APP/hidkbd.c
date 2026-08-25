@@ -3,7 +3,7 @@
  * Author             : WCH
  * Version            : V1.0
  * Date               : 2018/12/10
- * Description        : À¶ÑÀ¼üÅÌÓ¦ÓÃ³ÌÐò£¬³õÊ¼»¯¹ã²¥Á¬½Ó²ÎÊý£¬È»ºó¹ã²¥£¬Ö±ÖÁÁ¬½ÓÖ÷»úºó£¬¶¨Ê±ÉÏ´«¼üÖµ
+ * Description        : è“ç‰™é”®ç›˜åº”ç”¨ç¨‹åºï¼Œåˆå§‹åŒ–å¹¿æ’­è¿žæŽ¥å‚æ•°ï¼Œç„¶åŽå¹¿æ’­ï¼Œç›´è‡³è¿žæŽ¥ä¸»æœºåŽï¼Œå®šæ—¶ä¸Šä¼ é”®å€¼
  *********************************************************************************
  * Copyright (c) 2021 Nanjing Qinheng Microelectronics Co., Ltd.
  * Attention: This software (modified or not) and binary are used for 
@@ -28,6 +28,11 @@
 
 // HID LED output report length
 #define HID_LED_OUT_RPT_LEN                  1
+
+/* Convenience wrapper for the old single-keycode callers: sends a single
+ * keycode with no modifier bits.  Kept as a macro so existing call sites in
+ * HidEmu_ProcessEvent can stay 1-line and still use the shared 2-arg impl. */
+#define HIDEMU_SEND_KBD_SINGLE(c)   hidEmuSendKbdReport(0, (c))
 
 /*********************************************************************
  * CONSTANTS
@@ -162,7 +167,7 @@ static uint16_t hidEmuConnHandle = GAP_CONNHANDLE_INIT;
  */
 
 static void    hidEmu_ProcessTMOSMsg(tmos_event_hdr_t *pMsg);
-static void    hidEmuSendKbdReport(uint8_t keycode);
+static void    hidEmuSendKbdReport(uint8_t modifier, uint8_t keycode);
 static uint8_t hidEmuRcvReport(uint8_t len, uint8_t *pData);
 static uint8_t hidEmuRptCB(uint8_t id, uint8_t type, uint16_t uuid,
                            uint8_t oper, uint16_t *pLen, uint8_t *pData);
@@ -307,11 +312,11 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
 
     if(events & START_REPORT_EVT)
     {
-        hidEmuSendKbdReport(send_char);
+        HIDEMU_SEND_KBD_SINGLE(send_char);
         send_char++;
         if(send_char >= 29)
             send_char = 4;
-        hidEmuSendKbdReport(0x00);
+        HIDEMU_SEND_KBD_SINGLE(0x00);
         tmos_start_task(hidEmuTaskId, START_REPORT_EVT, 2000);
         return (events ^ START_REPORT_EVT);
     }
@@ -341,25 +346,157 @@ static void hidEmu_ProcessTMOSMsg(tmos_event_hdr_t *pMsg)
  *
  * @brief   Build and send a HID keyboard report.
  *
- * @param   keycode - HID keycode.
+ * @param   modifier - HID modifier bitmap (bit0=LCTRL, bit1=LSHIFT, ...).
+ * @param   keycode  - HID keycode.
  *
  * @return  none
  */
-static void hidEmuSendKbdReport(uint8_t keycode)
+static void hidEmuSendKbdReport(uint8_t modifier, uint8_t keycode)
 {
     uint8_t buf[HID_KEYBOARD_IN_RPT_LEN];
 
-    buf[0] = 0;       // Modifier keys
-    buf[1] = 0;       // Reserved
-    buf[2] = keycode; // Keycode 1
-    buf[3] = 0;       // Keycode 2
-    buf[4] = 0;       // Keycode 3
-    buf[5] = 0;       // Keycode 4
-    buf[6] = 0;       // Keycode 5
-    buf[7] = 0;       // Keycode 6
+    buf[0] = modifier; // Modifier keys
+    buf[1] = 0;        // Reserved
+    buf[2] = keycode;  // Keycode 1
+    buf[3] = 0;        // Keycode 2
+    buf[4] = 0;        // Keycode 3
+    buf[5] = 0;        // Keycode 4
+    buf[6] = 0;        // Keycode 5
+    buf[7] = 0;        // Keycode 6
 
     HidDev_Report(HID_RPT_ID_KEY_IN, HID_REPORT_TYPE_INPUT,
                   HID_KEYBOARD_IN_RPT_LEN, buf);
+}
+
+/* -------------------------------------------------------------------
+ * HID modifier bitmap and keycode mapping for printable ASCII.
+ *
+ * Standard USB HID keycodes:
+ *   a-z        -> 0x04..0x1D   (shift for uppercase)
+ *   '1'-'9'    -> 0x1E..0x26
+ *   '0'        -> 0x27
+ *   '!'..')'   -> 1-0 with shift
+ *   ' '        -> 0x2C
+ *   '-' / '_'  -> 0x2D / 0x2D+shift
+ *   '=' / '+'  -> 0x2E / 0x2E+shift
+ *   '[' / '{'  -> 0x2F / 0x2F+shift
+ *   ']' / '}'  -> 0x30 / 0x30+shift
+ *   '\\' / '|' -> 0x31 / 0x31+shift
+ *   ';' / ':'  -> 0x33 / 0x33+shift
+ *   '\'' / '"' -> 0x34 / 0x34+shift
+ *   '`' / '~'  -> 0x35 / 0x35+shift
+ *   ',' / '<'  -> 0x36 / 0x36+shift
+ *   '.' / '>'  -> 0x37 / 0x37+shift
+ *   '/' / '?'  -> 0x38 / 0x38+shift
+ * ----------------------------------------------------------------- */
+
+#define HID_MOD_LSHIFT     0x02
+
+/*
+ * Convert one ASCII character to (modifier, keycode) pair.
+ * Returns 0 on success, -1 for unsupported characters.
+ */
+static int ascii_to_hid(char ch, uint8_t *modifier, uint8_t *keycode)
+{
+    uint8_t mod = 0;
+    uint8_t kc  = 0;
+
+    if (ch >= 'a' && ch <= 'z') {
+        kc = 0x04 + (uint8_t)(ch - 'a');
+    } else if (ch >= 'A' && ch <= 'Z') {
+        mod = HID_MOD_LSHIFT;
+        kc  = 0x04 + (uint8_t)(ch - 'A');
+    } else if (ch >= '1' && ch <= '9') {
+        kc = 0x1E + (uint8_t)(ch - '1');
+    } else if (ch == '0') {
+        kc = 0x27;
+    } else {
+        switch (ch) {
+            /* digits + shift => shifted-number symbols */
+            case '!': mod = HID_MOD_LSHIFT; kc = 0x1E; break; /* 1 */
+            case '@': mod = HID_MOD_LSHIFT; kc = 0x1F; break; /* 2 */
+            case '#': mod = HID_MOD_LSHIFT; kc = 0x20; break; /* 3 */
+            case '$': mod = HID_MOD_LSHIFT; kc = 0x21; break; /* 4 */
+            case '%': mod = HID_MOD_LSHIFT; kc = 0x22; break; /* 5 */
+            case '^': mod = HID_MOD_LSHIFT; kc = 0x23; break; /* 6 */
+            case '&': mod = HID_MOD_LSHIFT; kc = 0x24; break; /* 7 */
+            case '*': mod = HID_MOD_LSHIFT; kc = 0x25; break; /* 8 */
+            case '(': mod = HID_MOD_LSHIFT; kc = 0x26; break; /* 9 */
+            case ')': mod = HID_MOD_LSHIFT; kc = 0x27; break; /* 0 */
+            case ' ': kc = 0x2C; break;
+            case '-': kc = 0x2D; break;
+            case '_': mod = HID_MOD_LSHIFT; kc = 0x2D; break;
+            case '=': kc = 0x2E; break;
+            case '+': mod = HID_MOD_LSHIFT; kc = 0x2E; break;
+            case '[': kc = 0x2F; break;
+            case '{': mod = HID_MOD_LSHIFT; kc = 0x2F; break;
+            case ']': kc = 0x30; break;
+            case '}': mod = HID_MOD_LSHIFT; kc = 0x30; break;
+            case '\\': kc = 0x31; break;
+            case '|':  mod = HID_MOD_LSHIFT; kc = 0x31; break;
+            case ';':  kc = 0x33; break;
+            case ':':  mod = HID_MOD_LSHIFT; kc = 0x33; break;
+            case '\'': kc = 0x34; break;
+            case '"':  mod = HID_MOD_LSHIFT; kc = 0x34; break;
+            case '`':  kc = 0x35; break;
+            case '~':  mod = HID_MOD_LSHIFT; kc = 0x35; break;
+            case ',':  kc = 0x36; break;
+            case '<':  mod = HID_MOD_LSHIFT; kc = 0x36; break;
+            case '.':  kc = 0x37; break;
+            case '>':  mod = HID_MOD_LSHIFT; kc = 0x37; break;
+            case '/':  kc = 0x38; break;
+            case '?':  mod = HID_MOD_LSHIFT; kc = 0x38; break;
+            default:
+                return -1;
+        }
+    }
+    *modifier = mod;
+    *keycode  = kc;
+    return 0;
+}
+
+/* Small busy-wait between keystrokes so reports don't stack up on a slow host.
+ * tmos tick is roughly 625us; each unit ~ 0.625ms.  1 unit ~0.6ms between keys
+ * is enough for most HID hosts; we keep it tiny to still be "fast typing". */
+static inline void hidkbd_busy_ticks(uint16_t ticks)
+{
+    volatile uint32_t start = TMOS_GetSystemClock();
+    while ((uint16_t)(TMOS_GetSystemClock() - start) < ticks) {
+        __asm volatile("nop");
+    }
+}
+
+/*********************************************************************
+ * @fn      hidkbd_type_text
+ *
+ * @brief   Type a NUL-terminated ASCII string through the BLE HID
+ *          keyboard.  Each character produces a press-report followed
+ *          immediately by a release-report (all-zero).  Unmapped chars
+ *          are skipped; callers should NOT free the buffer afterwards.
+ *          Requires HID report notifications enabled (i.e. host is
+ *          connected and the HID profile has been started).
+ *
+ * @param   text   NUL-terminated ASCII string.
+ *
+ * @return  number of characters successfully typed (>=0).
+ */
+int hidkbd_type_text(const char *text)
+{
+    if (!text) return 0;
+
+    int typed = 0;
+    for (const char *p = text; *p; p++) {
+        uint8_t mod, kc;
+        if (ascii_to_hid(*p, &mod, &kc) != 0) {
+            continue;                /* unsupported, skip */
+        }
+        hidEmuSendKbdReport(mod, kc);           /* press */
+        hidkbd_busy_ticks(1);                   /* ~0.6ms */
+        hidEmuSendKbdReport(0, 0);              /* release all */
+        hidkbd_busy_ticks(1);
+        typed++;
+    }
+    return typed;
 }
 
 /*********************************************************************

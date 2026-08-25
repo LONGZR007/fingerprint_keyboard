@@ -52,6 +52,14 @@ extern void HidEmu_Init(void);
  */
 extern uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events);
 
+/*
+ * Type an ASCII string (letters / digits / common punctuation) through
+ * the BLE HID keyboard.  Returns the number of characters successfully
+ * transmitted (unsupported / control characters are silently skipped).
+ * Requires HID notifications enabled (i.e. host connected).
+ */
+extern int hidkbd_type_text(const char *text);
+
 /*********************************************************************
 *********************************************************************/
 
