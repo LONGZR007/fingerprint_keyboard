@@ -1,0 +1,669 @@
+/********************************** (C) COPYRIGHT *******************************
+ * File Name          : hidkbd.c
+ * Author             : WCH
+ * Version            : V1.0
+ * Date               : 2018/12/10
+ * Description        : 蓝牙键盘应用程序，初始化广播连接参数，然后广播，直至连接主机后，定时上传键值
+ *********************************************************************************
+ * Copyright (c) 2021 Nanjing Qinheng Microelectronics Co., Ltd.
+ * Attention: This software (modified or not) and binary are used for 
+ * microcontroller manufactured by Nanjing Qinheng Microelectronics.
+ *******************************************************************************/
+
+/*********************************************************************
+ * INCLUDES
+ */
+#include "CONFIG.h"
+#include "devinfoservice.h"
+#include "battservice.h"
+#include "hidkbdservice.h"
+#include "hiddev.h"
+#include "hidkbd.h"
+
+/*********************************************************************
+ * MACROS
+ */
+// HID keyboard input report length
+#define HID_KEYBOARD_IN_RPT_LEN              8
+
+// HID LED output report length
+#define HID_LED_OUT_RPT_LEN                  1
+
+/* Convenience wrapper for the old single-keycode callers: sends a single
+ * keycode with no modifier bits.  Kept as a macro so existing call sites in
+ * HidEmu_ProcessEvent can stay 1-line and still use the shared 2-arg impl. */
+#define HIDEMU_SEND_KBD_SINGLE(c)   hidEmuSendKbdReport(0, (c))
+
+/*********************************************************************
+ * CONSTANTS
+ */
+// Param update delay
+#define START_PARAM_UPDATE_EVT_DELAY         12800
+
+// Param update delay
+#define START_PHY_UPDATE_DELAY               1600
+
+// HID idle timeout in msec; set to zero to disable timeout
+#define DEFAULT_HID_IDLE_TIMEOUT             60000
+
+// Minimum connection interval (units of 1.25ms)
+#define DEFAULT_DESIRED_MIN_CONN_INTERVAL    8
+
+// Maximum connection interval (units of 1.25ms)
+#define DEFAULT_DESIRED_MAX_CONN_INTERVAL    8
+
+// Slave latency to use if parameter update request
+#define DEFAULT_DESIRED_SLAVE_LATENCY        0
+
+// Supervision timeout value (units of 10ms)
+#define DEFAULT_DESIRED_CONN_TIMEOUT         500
+
+// Default passcode
+#define DEFAULT_PASSCODE                     0
+
+// Default GAP pairing mode
+#define DEFAULT_PAIRING_MODE                 GAPBOND_PAIRING_MODE_WAIT_FOR_REQ
+
+// Default MITM mode (TRUE to require passcode or OOB when pairing)
+#define DEFAULT_MITM_MODE                    FALSE
+
+// Default bonding mode, TRUE to bond
+#define DEFAULT_BONDING_MODE                 TRUE
+
+// Default GAP bonding I/O capabilities
+#define DEFAULT_IO_CAPABILITIES              GAPBOND_IO_CAP_NO_INPUT_NO_OUTPUT
+
+// Battery level is critical when it is less than this %
+#define DEFAULT_BATT_CRITICAL_LEVEL          6
+
+/*********************************************************************
+ * TYPEDEFS
+ */
+
+/*********************************************************************
+ * GLOBAL VARIABLES
+ */
+
+// Task ID
+static uint8_t hidEmuTaskId = INVALID_TASK_ID;
+
+/*********************************************************************
+ * EXTERNAL VARIABLES
+ */
+
+/*********************************************************************
+ * EXTERNAL FUNCTIONS
+ */
+
+/*********************************************************************
+ * LOCAL VARIABLES
+ */
+
+// GAP Profile - Name attribute for SCAN RSP data
+static uint8_t scanRspData[] = {
+    0x05, // length of this data
+    GAP_ADTYPE_SLAVE_CONN_INTERVAL_RANGE,
+    LO_UINT16(DEFAULT_DESIRED_MIN_CONN_INTERVAL), // 100ms
+    HI_UINT16(DEFAULT_DESIRED_MIN_CONN_INTERVAL),
+    LO_UINT16(DEFAULT_DESIRED_MAX_CONN_INTERVAL), // 1s
+    HI_UINT16(DEFAULT_DESIRED_MAX_CONN_INTERVAL),
+
+    // service UUIDs
+    0x05, // length of this data
+    GAP_ADTYPE_16BIT_MORE,
+    LO_UINT16(HID_SERV_UUID),
+    HI_UINT16(HID_SERV_UUID),
+    LO_UINT16(BATT_SERV_UUID),
+    HI_UINT16(BATT_SERV_UUID),
+
+    // Tx power level
+    0x02, // length of this data
+    GAP_ADTYPE_POWER_LEVEL,
+    0 // 0dBm
+};
+
+// Advertising data
+static uint8_t advertData[] = {
+    // flags
+    0x02, // length of this data
+    GAP_ADTYPE_FLAGS,
+    GAP_ADTYPE_FLAGS_LIMITED | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED,
+
+    // appearance
+    0x03, // length of this data
+    GAP_ADTYPE_APPEARANCE,
+    LO_UINT16(GAP_APPEARE_HID_KEYBOARD),
+    HI_UINT16(GAP_APPEARE_HID_KEYBOARD),
+
+    0x0D,                           // length of this data
+    GAP_ADTYPE_LOCAL_NAME_COMPLETE, // AD Type = Complete local name
+    'H',
+    'I',
+    'D',
+    ' ',
+    'K',
+    'e',
+    'y',
+    'b',
+    'r',
+    'o',
+    'a',
+    'd',  // connection interval range
+};
+
+// Device name attribute value
+static const uint8_t attDeviceName[GAP_DEVICE_NAME_LEN] = "HID Keyboard";
+
+// HID Dev configuration
+static hidDevCfg_t hidEmuCfg = {
+    DEFAULT_HID_IDLE_TIMEOUT, // Idle timeout
+    HID_FEATURE_FLAGS         // HID feature flags
+};
+
+static uint16_t hidEmuConnHandle = GAP_CONNHANDLE_INIT;
+
+/*********************************************************************
+ * LOCAL FUNCTIONS
+ */
+
+static void    hidEmu_ProcessTMOSMsg(tmos_event_hdr_t *pMsg);
+static void    hidEmuSendKbdReport(uint8_t modifier, uint8_t keycode);
+static uint8_t hidEmuRcvReport(uint8_t len, uint8_t *pData);
+static uint8_t hidEmuRptCB(uint8_t id, uint8_t type, uint16_t uuid,
+                           uint8_t oper, uint16_t *pLen, uint8_t *pData);
+static void    hidEmuEvtCB(uint8_t evt);
+static void    hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent);
+
+/*********************************************************************
+ * PROFILE CALLBACKS
+ */
+
+static hidDevCB_t hidEmuHidCBs = {
+    hidEmuRptCB,
+    hidEmuEvtCB,
+    NULL,
+    hidEmuStateCB};
+
+/*********************************************************************
+ * PUBLIC FUNCTIONS
+ */
+
+/*********************************************************************
+ * @fn      HidEmu_Init
+ *
+ * @brief   Initialization function for the HidEmuKbd App Task.
+ *          This is called during initialization and should contain
+ *          any application specific initialization (ie. hardware
+ *          initialization/setup, table initialization, power up
+ *          notificaiton ... ).
+ *
+ * @param   task_id - the ID assigned by TMOS.  This ID should be
+ *                    used to send messages and set timers.
+ *
+ * @return  none
+ */
+void HidEmu_Init()
+{
+    hidEmuTaskId = TMOS_ProcessEventRegister(HidEmu_ProcessEvent);
+
+    // Setup the GAP Peripheral Role Profile
+    {
+        uint8_t initial_advertising_enable = TRUE;
+
+        // Set the GAP Role Parameters
+        GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t), &initial_advertising_enable);
+
+        GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(advertData), advertData);
+        GAPRole_SetParameter(GAPROLE_SCAN_RSP_DATA, sizeof(scanRspData), scanRspData);
+    }
+
+    // Set the GAP Characteristics
+    GGS_SetParameter(GGS_DEVICE_NAME_ATT, sizeof(attDeviceName), (void *)attDeviceName);
+
+    // Setup the GAP Bond Manager
+    {
+        uint32_t passkey = DEFAULT_PASSCODE;
+        uint8_t  pairMode = DEFAULT_PAIRING_MODE;
+        uint8_t  mitm = DEFAULT_MITM_MODE;
+        uint8_t  ioCap = DEFAULT_IO_CAPABILITIES;
+        uint8_t  bonding = DEFAULT_BONDING_MODE;
+        GAPBondMgr_SetParameter(GAPBOND_PERI_DEFAULT_PASSCODE, sizeof(uint32_t), &passkey);
+        GAPBondMgr_SetParameter(GAPBOND_PERI_PAIRING_MODE, sizeof(uint8_t), &pairMode);
+        GAPBondMgr_SetParameter(GAPBOND_PERI_MITM_PROTECTION, sizeof(uint8_t), &mitm);
+        GAPBondMgr_SetParameter(GAPBOND_PERI_IO_CAPABILITIES, sizeof(uint8_t), &ioCap);
+        GAPBondMgr_SetParameter(GAPBOND_PERI_BONDING_ENABLED, sizeof(uint8_t), &bonding);
+    }
+
+    // Setup Battery Characteristic Values
+    {
+        uint8_t critical = DEFAULT_BATT_CRITICAL_LEVEL;
+        Batt_SetParameter(BATT_PARAM_CRITICAL_LEVEL, sizeof(uint8_t), &critical);
+    }
+
+    // Set up HID keyboard service
+    Hid_AddService();
+
+    // Register for HID Dev callback
+    HidDev_Register(&hidEmuCfg, &hidEmuHidCBs);
+
+    // Setup a delayed profile startup
+    tmos_set_event(hidEmuTaskId, START_DEVICE_EVT);
+}
+
+/*********************************************************************
+ * @fn      HidEmu_ProcessEvent
+ *
+ * @brief   HidEmuKbd Application Task event processor.  This function
+ *          is called to process all events for the task.  Events
+ *          include timers, messages and any other user defined events.
+ *
+ * @param   task_id  - The TMOS assigned task ID.
+ * @param   events - events to process.  This is a bit map and can
+ *                   contain more than one event.
+ *
+ * @return  events not processed
+ */
+uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
+{
+    static uint8_t send_char = 4;
+
+    if(events & SYS_EVENT_MSG)
+    {
+        uint8_t *pMsg;
+
+        if((pMsg = tmos_msg_receive(hidEmuTaskId)) != NULL)
+        {
+            hidEmu_ProcessTMOSMsg((tmos_event_hdr_t *)pMsg);
+
+            // Release the TMOS message
+            tmos_msg_deallocate(pMsg);
+        }
+
+        // return unprocessed events
+        return (events ^ SYS_EVENT_MSG);
+    }
+
+    if(events & START_DEVICE_EVT)
+    {
+        return (events ^ START_DEVICE_EVT);
+    }
+
+    if(events & START_PARAM_UPDATE_EVT)
+    {
+        // Send connect param update request
+        GAPRole_PeripheralConnParamUpdateReq(hidEmuConnHandle,
+                                             DEFAULT_DESIRED_MIN_CONN_INTERVAL,
+                                             DEFAULT_DESIRED_MAX_CONN_INTERVAL,
+                                             DEFAULT_DESIRED_SLAVE_LATENCY,
+                                             DEFAULT_DESIRED_CONN_TIMEOUT,
+                                             hidEmuTaskId);
+
+        return (events ^ START_PARAM_UPDATE_EVT);
+    }
+
+    if(events & START_PHY_UPDATE_EVT)
+    {
+        // start phy update
+        PRINT("Send Phy Update %x...\n", GAPRole_UpdatePHY(hidEmuConnHandle, 0, 
+                    GAP_PHY_BIT_LE_2M, GAP_PHY_BIT_LE_2M, GAP_PHY_OPTIONS_NOPRE));
+
+        return (events ^ START_PHY_UPDATE_EVT);
+    }
+
+    if(events & START_REPORT_EVT)
+    {
+        HIDEMU_SEND_KBD_SINGLE(send_char);
+        send_char++;
+        if(send_char >= 29)
+            send_char = 4;
+        HIDEMU_SEND_KBD_SINGLE(0x00);
+        tmos_start_task(hidEmuTaskId, START_REPORT_EVT, 2000);
+        return (events ^ START_REPORT_EVT);
+    }
+    return 0;
+}
+
+/*********************************************************************
+ * @fn      hidEmu_ProcessTMOSMsg
+ *
+ * @brief   Process an incoming task message.
+ *
+ * @param   pMsg - message to process
+ *
+ * @return  none
+ */
+static void hidEmu_ProcessTMOSMsg(tmos_event_hdr_t *pMsg)
+{
+    switch(pMsg->event)
+    {
+        default:
+            break;
+    }
+}
+
+/*********************************************************************
+ * @fn      hidEmuSendKbdReport
+ *
+ * @brief   Build and send a HID keyboard report.
+ *
+ * @param   modifier - HID modifier bitmap (bit0=LCTRL, bit1=LSHIFT, ...).
+ * @param   keycode  - HID keycode.
+ *
+ * @return  none
+ */
+static void hidEmuSendKbdReport(uint8_t modifier, uint8_t keycode)
+{
+    uint8_t buf[HID_KEYBOARD_IN_RPT_LEN];
+
+    buf[0] = modifier; // Modifier keys
+    buf[1] = 0;        // Reserved
+    buf[2] = keycode;  // Keycode 1
+    buf[3] = 0;        // Keycode 2
+    buf[4] = 0;        // Keycode 3
+    buf[5] = 0;        // Keycode 4
+    buf[6] = 0;        // Keycode 5
+    buf[7] = 0;        // Keycode 6
+
+    HidDev_Report(HID_RPT_ID_KEY_IN, HID_REPORT_TYPE_INPUT,
+                  HID_KEYBOARD_IN_RPT_LEN, buf);
+}
+
+/* -------------------------------------------------------------------
+ * HID modifier bitmap and keycode mapping for printable ASCII.
+ *
+ * Standard USB HID keycodes:
+ *   a-z        -> 0x04..0x1D   (shift for uppercase)
+ *   '1'-'9'    -> 0x1E..0x26
+ *   '0'        -> 0x27
+ *   '!'..')'   -> 1-0 with shift
+ *   ' '        -> 0x2C
+ *   '-' / '_'  -> 0x2D / 0x2D+shift
+ *   '=' / '+'  -> 0x2E / 0x2E+shift
+ *   '[' / '{'  -> 0x2F / 0x2F+shift
+ *   ']' / '}'  -> 0x30 / 0x30+shift
+ *   '\\' / '|' -> 0x31 / 0x31+shift
+ *   ';' / ':'  -> 0x33 / 0x33+shift
+ *   '\'' / '"' -> 0x34 / 0x34+shift
+ *   '`' / '~'  -> 0x35 / 0x35+shift
+ *   ',' / '<'  -> 0x36 / 0x36+shift
+ *   '.' / '>'  -> 0x37 / 0x37+shift
+ *   '/' / '?'  -> 0x38 / 0x38+shift
+ * ----------------------------------------------------------------- */
+
+#define HID_MOD_LSHIFT     0x02
+
+/*
+ * Convert one ASCII character to (modifier, keycode) pair.
+ * Returns 0 on success, -1 for unsupported characters.
+ */
+static int ascii_to_hid(char ch, uint8_t *modifier, uint8_t *keycode)
+{
+    uint8_t mod = 0;
+    uint8_t kc  = 0;
+
+    if (ch >= 'a' && ch <= 'z') {
+        kc = 0x04 + (uint8_t)(ch - 'a');
+    } else if (ch >= 'A' && ch <= 'Z') {
+        mod = HID_MOD_LSHIFT;
+        kc  = 0x04 + (uint8_t)(ch - 'A');
+    } else if (ch >= '1' && ch <= '9') {
+        kc = 0x1E + (uint8_t)(ch - '1');
+    } else if (ch == '0') {
+        kc = 0x27;
+    } else {
+        switch (ch) {
+            /* digits + shift => shifted-number symbols */
+            case '!': mod = HID_MOD_LSHIFT; kc = 0x1E; break; /* 1 */
+            case '@': mod = HID_MOD_LSHIFT; kc = 0x1F; break; /* 2 */
+            case '#': mod = HID_MOD_LSHIFT; kc = 0x20; break; /* 3 */
+            case '$': mod = HID_MOD_LSHIFT; kc = 0x21; break; /* 4 */
+            case '%': mod = HID_MOD_LSHIFT; kc = 0x22; break; /* 5 */
+            case '^': mod = HID_MOD_LSHIFT; kc = 0x23; break; /* 6 */
+            case '&': mod = HID_MOD_LSHIFT; kc = 0x24; break; /* 7 */
+            case '*': mod = HID_MOD_LSHIFT; kc = 0x25; break; /* 8 */
+            case '(': mod = HID_MOD_LSHIFT; kc = 0x26; break; /* 9 */
+            case ')': mod = HID_MOD_LSHIFT; kc = 0x27; break; /* 0 */
+            case ' ': kc = 0x2C; break;
+            case '-': kc = 0x2D; break;
+            case '_': mod = HID_MOD_LSHIFT; kc = 0x2D; break;
+            case '=': kc = 0x2E; break;
+            case '+': mod = HID_MOD_LSHIFT; kc = 0x2E; break;
+            case '[': kc = 0x2F; break;
+            case '{': mod = HID_MOD_LSHIFT; kc = 0x2F; break;
+            case ']': kc = 0x30; break;
+            case '}': mod = HID_MOD_LSHIFT; kc = 0x30; break;
+            case '\\': kc = 0x31; break;
+            case '|':  mod = HID_MOD_LSHIFT; kc = 0x31; break;
+            case ';':  kc = 0x33; break;
+            case ':':  mod = HID_MOD_LSHIFT; kc = 0x33; break;
+            case '\'': kc = 0x34; break;
+            case '"':  mod = HID_MOD_LSHIFT; kc = 0x34; break;
+            case '`':  kc = 0x35; break;
+            case '~':  mod = HID_MOD_LSHIFT; kc = 0x35; break;
+            case ',':  kc = 0x36; break;
+            case '<':  mod = HID_MOD_LSHIFT; kc = 0x36; break;
+            case '.':  kc = 0x37; break;
+            case '>':  mod = HID_MOD_LSHIFT; kc = 0x37; break;
+            case '/':  kc = 0x38; break;
+            case '?':  mod = HID_MOD_LSHIFT; kc = 0x38; break;
+            default:
+                return -1;
+        }
+    }
+    *modifier = mod;
+    *keycode  = kc;
+    return 0;
+}
+
+/* Small busy-wait between keystrokes so reports don't stack up on a slow host.
+ * tmos tick is roughly 625us; each unit ~ 0.625ms.  1 unit ~0.6ms between keys
+ * is enough for most HID hosts; we keep it tiny to still be "fast typing". */
+static inline void hidkbd_busy_ticks(uint16_t ticks)
+{
+    volatile uint32_t start = TMOS_GetSystemClock();
+    while ((uint16_t)(TMOS_GetSystemClock() - start) < ticks) {
+        __asm volatile("nop");
+    }
+}
+
+/*********************************************************************
+ * @fn      hidkbd_type_text
+ *
+ * @brief   Type a NUL-terminated ASCII string through the BLE HID
+ *          keyboard.  Each character produces a press-report followed
+ *          immediately by a release-report (all-zero).  Unmapped chars
+ *          are skipped; callers should NOT free the buffer afterwards.
+ *          Requires HID report notifications enabled (i.e. host is
+ *          connected and the HID profile has been started).
+ *
+ * @param   text   NUL-terminated ASCII string.
+ *
+ * @return  number of characters successfully typed (>=0).
+ */
+int hidkbd_type_text(const char *text)
+{
+    if (!text) return 0;
+
+    int typed = 0;
+    for (const char *p = text; *p; p++) {
+        uint8_t mod, kc;
+        if (ascii_to_hid(*p, &mod, &kc) != 0) {
+            continue;                /* unsupported, skip */
+        }
+        hidEmuSendKbdReport(mod, kc);           /* press */
+        hidkbd_busy_ticks(1);                   /* ~0.6ms */
+        hidEmuSendKbdReport(0, 0);              /* release all */
+        hidkbd_busy_ticks(1);
+        typed++;
+    }
+    return typed;
+}
+
+/*********************************************************************
+ * @fn      hidEmuStateCB
+ *
+ * @brief   GAP state change callback.
+ *
+ * @param   newState - new state
+ *
+ * @return  none
+ */
+static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
+{
+    switch(newState & GAPROLE_STATE_ADV_MASK)
+    {
+        case GAPROLE_STARTED:
+        {
+            uint8_t ownAddr[6];
+            GAPRole_GetParameter(GAPROLE_BD_ADDR, ownAddr);
+            GAP_ConfigDeviceAddr(ADDRTYPE_STATIC, ownAddr);
+            PRINT("Initialized..\n");
+        }
+        break;
+
+        case GAPROLE_ADVERTISING:
+            if(pEvent->gap.opcode == GAP_MAKE_DISCOVERABLE_DONE_EVENT)
+            {
+                PRINT("Advertising..\n");
+            }
+            break;
+
+        case GAPROLE_CONNECTED:
+            if(pEvent->gap.opcode == GAP_LINK_ESTABLISHED_EVENT)
+            {
+                gapEstLinkReqEvent_t *event = (gapEstLinkReqEvent_t *)pEvent;
+
+                // get connection handle
+                hidEmuConnHandle = event->connectionHandle;
+                tmos_start_task(hidEmuTaskId, START_PARAM_UPDATE_EVT, START_PARAM_UPDATE_EVT_DELAY);
+                PRINT("Connected..\n");
+            }
+            break;
+
+        case GAPROLE_CONNECTED_ADV:
+            if(pEvent->gap.opcode == GAP_MAKE_DISCOVERABLE_DONE_EVENT)
+            {
+                PRINT("Connected Advertising..\n");
+            }
+            break;
+
+        case GAPROLE_WAITING:
+            if(pEvent->gap.opcode == GAP_END_DISCOVERABLE_DONE_EVENT)
+            {
+                PRINT("Waiting for advertising..\n");
+            }
+            else if(pEvent->gap.opcode == GAP_LINK_TERMINATED_EVENT)
+            {
+                PRINT("Disconnected.. Reason:%x\n", pEvent->linkTerminate.reason);
+            }
+            else if(pEvent->gap.opcode == GAP_LINK_ESTABLISHED_EVENT)
+            {
+                PRINT("Advertising timeout..\n");
+            }
+            // Enable advertising
+            {
+                uint8_t initial_advertising_enable = TRUE;
+                // Set the GAP Role Parameters
+                GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t), &initial_advertising_enable);
+            }
+            break;
+
+        case GAPROLE_ERROR:
+            PRINT("Error %x ..\n", pEvent->gap.opcode);
+            break;
+
+        default:
+            break;
+    }
+}
+
+/*********************************************************************
+ * @fn      hidEmuRcvReport
+ *
+ * @brief   Process an incoming HID keyboard report.
+ *
+ * @param   len - Length of report.
+ * @param   pData - Report data.
+ *
+ * @return  status
+ */
+static uint8_t hidEmuRcvReport(uint8_t len, uint8_t *pData)
+{
+    // verify data length
+    if(len == HID_LED_OUT_RPT_LEN)
+    {
+        // set LEDs
+        return SUCCESS;
+    }
+    else
+    {
+        return ATT_ERR_INVALID_VALUE_SIZE;
+    }
+}
+
+/*********************************************************************
+ * @fn      hidEmuRptCB
+ *
+ * @brief   HID Dev report callback.
+ *
+ * @param   id - HID report ID.
+ * @param   type - HID report type.
+ * @param   uuid - attribute uuid.
+ * @param   oper - operation:  read, write, etc.
+ * @param   len - Length of report.
+ * @param   pData - Report data.
+ *
+ * @return  GATT status code.
+ */
+static uint8_t hidEmuRptCB(uint8_t id, uint8_t type, uint16_t uuid,
+                           uint8_t oper, uint16_t *pLen, uint8_t *pData)
+{
+    uint8_t status = SUCCESS;
+
+    // write
+    if(oper == HID_DEV_OPER_WRITE)
+    {
+        if(uuid == REPORT_UUID)
+        {
+            // process write to LED output report; ignore others
+            if(type == HID_REPORT_TYPE_OUTPUT)
+            {
+                status = hidEmuRcvReport(*pLen, pData);
+            }
+        }
+
+        if(status == SUCCESS)
+        {
+            status = Hid_SetParameter(id, type, uuid, *pLen, pData);
+        }
+    }
+    // read
+    else if(oper == HID_DEV_OPER_READ)
+    {
+        status = Hid_GetParameter(id, type, uuid, pLen, pData);
+    }
+    // notifications enabled
+    else if(oper == HID_DEV_OPER_ENABLE)
+    {
+        tmos_start_task(hidEmuTaskId, START_REPORT_EVT, 500);
+    }
+    return status;
+}
+
+/*********************************************************************
+ * @fn      hidEmuEvtCB
+ *
+ * @brief   HID Dev event callback.
+ *
+ * @param   evt - event ID.
+ *
+ * @return  HID response code.
+ */
+static void hidEmuEvtCB(uint8_t evt)
+{
+    // process enter/exit suspend or enter/exit boot mode
+    return;
+}
+
+/*********************************************************************
+*********************************************************************/

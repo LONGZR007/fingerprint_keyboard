@@ -1,0 +1,2 @@
+#!/bin/bash
+exec /usr/bin/riscv64-unknown-elf-as "$@" -march=rv32imac_zicsr_zifencei
