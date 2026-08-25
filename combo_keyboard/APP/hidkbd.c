@@ -19,6 +19,7 @@
 #include "hidkbdservice.h"
 #include "hiddev.h"
 #include "hidkbd.h"
+#include <string.h>
 
 /*********************************************************************
  * MACROS
@@ -162,6 +163,38 @@ static hidDevCfg_t hidEmuCfg = {
 
 static uint16_t hidEmuConnHandle = GAP_CONNHANDLE_INIT;
 
+/* --------------------------------------------------------------------
+ * Async string-type state machine.
+ *
+ * 每 tick = 625us。按键节奏：
+ *   press -> 2 ticks (~1.25ms) -> release -> 2 ticks (~1.25ms) -> next press
+ * 每个字符跨 3 个 START_TYPE_EVT 事件推进：
+ *   STEP_PRESS  -> 发送按下报告，2 ticks 后进入 STEP_RELEASE
+ *   STEP_RELEASE-> 发送全零释放报告，2 ticks 后进入 STEP_NEXT
+ *   STEP_NEXT   -> 索引前进，进入下一个字符 STEP_PRESS
+ * 状态机只在 START_TYPE_EVT 事件中推进，绝不在事件回调里阻塞，确保
+ * BLE GAP/GATT/连接事件有足够调度窗口，避免"只发前两字符"丢包。
+ *
+ * 复用 START_REPORT_EVT 期间的按键扫描互斥：sendStrBusy=1 时暂停原有
+ * START_REPORT_EVT 自动按键测试输出，防止键盘报告通道乱序。
+ * ----------------------------------------------------------------- */
+#define TYPE_BUF_SIZE        128
+#define TYPE_STEP_PRESS      0
+#define TYPE_STEP_RELEASE    1
+#define TYPE_STEP_NEXT       2
+#define TYPE_TICK_STEP       2   /* 每 step 之间的 tick 间隔 (~1.25ms) */
+
+static char     s_type_buf[TYPE_BUF_SIZE];
+static uint16_t s_type_len    = 0;
+static uint16_t s_type_idx    = 0;
+static uint8_t  s_type_step   = TYPE_STEP_PRESS;
+static uint8_t  s_type_mod    = 0;
+static uint8_t  s_type_kc     = 0;
+static volatile uint8_t s_type_busy = 0;
+static int           s_type_typed = 0;
+/* 当前字符是否为已支持字符（跳过的字符直接走 STEP_NEXT） */
+static uint8_t  s_type_supp = 0;
+
 /*********************************************************************
  * LOCAL FUNCTIONS
  */
@@ -173,6 +206,7 @@ static uint8_t hidEmuRptCB(uint8_t id, uint8_t type, uint16_t uuid,
                            uint8_t oper, uint16_t *pLen, uint8_t *pData);
 static void    hidEmuEvtCB(uint8_t evt);
 static void    hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent);
+static int     ascii_to_hid(char ch, uint8_t *modifier, uint8_t *keycode);
 
 /*********************************************************************
  * PROFILE CALLBACKS
@@ -312,13 +346,75 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
 
     if(events & START_REPORT_EVT)
     {
-        HIDEMU_SEND_KBD_SINGLE(send_char);
-        send_char++;
-        if(send_char >= 29)
-            send_char = 4;
-        HIDEMU_SEND_KBD_SINGLE(0x00);
+        if (!s_type_busy) {
+            static uint8_t send_char = 4;
+            HIDEMU_SEND_KBD_SINGLE(send_char);
+            send_char++;
+            if(send_char >= 29)
+                send_char = 4;
+            HIDEMU_SEND_KBD_SINGLE(0x00);
+        }
         tmos_start_task(hidEmuTaskId, START_REPORT_EVT, 2000);
         return (events ^ START_REPORT_EVT);
+    }
+
+    /* ---- Async HID string-type state machine ----
+     *
+     * 每个字符推进 3 个 event（共 ~3.75ms）：
+     *   PRESS (EVT)   → send press, 2 tick → RELEASE
+     *   RELEASE (EVT) → send 0x00 release, 2 tick → NEXT
+     *   NEXT (EVT)    → idx++, 0 tick → PRESS of next char
+     * 若字符不支持，PRESS 阶段直接跳到 NEXT，不发空报告。
+     *
+     * 绝不在此 busy-wait；所有推进由 tmos 定时事件驱动，
+     * 保证 BLE 协议栈连接事件/通知队列有充分调度窗口。 */
+    if(events & START_TYPE_EVT)
+    {
+        if (!s_type_busy) {
+            return (events ^ START_TYPE_EVT);
+        }
+        switch (s_type_step) {
+            case TYPE_STEP_PRESS: {
+                char ch = s_type_buf[s_type_idx];
+                uint8_t mod = 0, kc = 0;
+                if (ascii_to_hid(ch, &mod, &kc) == 0) {
+                    s_type_supp = 1;
+                    s_type_mod  = mod;
+                    s_type_kc   = kc;
+                    hidEmuSendKbdReport(mod, kc);
+                    s_type_step = TYPE_STEP_RELEASE;
+                    tmos_start_task(hidEmuTaskId, START_TYPE_EVT, TYPE_TICK_STEP);
+                } else {
+                    /* unsupported -> skip to next char immediately */
+                    s_type_supp = 0;
+                    s_type_step = TYPE_STEP_NEXT;
+                    tmos_start_task(hidEmuTaskId, START_TYPE_EVT, 0);
+                }
+                break;
+            }
+            case TYPE_STEP_RELEASE:
+                if (s_type_supp) {
+                    hidEmuSendKbdReport(0, 0);
+                    s_type_typed++;
+                }
+                s_type_step = TYPE_STEP_NEXT;
+                tmos_start_task(hidEmuTaskId, START_TYPE_EVT, TYPE_TICK_STEP);
+                break;
+
+            case TYPE_STEP_NEXT:
+                s_type_idx++;
+                if (s_type_idx >= s_type_len) {
+                    /* 全部发送完成 */
+                    s_type_busy = 0;
+                    s_type_step = TYPE_STEP_PRESS;
+                    s_type_len = s_type_idx = 0;
+                } else {
+                    s_type_step = TYPE_STEP_PRESS;
+                    tmos_start_task(hidEmuTaskId, START_TYPE_EVT, 0);
+                }
+                break;
+        }
+        return (events ^ START_TYPE_EVT);
     }
     return 0;
 }
@@ -455,48 +551,57 @@ static int ascii_to_hid(char ch, uint8_t *modifier, uint8_t *keycode)
     return 0;
 }
 
-/* Small busy-wait between keystrokes so reports don't stack up on a slow host.
- * tmos tick is roughly 625us; each unit ~ 0.625ms.  1 unit ~0.6ms between keys
- * is enough for most HID hosts; we keep it tiny to still be "fast typing". */
-static inline void hidkbd_busy_ticks(uint16_t ticks)
-{
-    volatile uint32_t start = TMOS_GetSystemClock();
-    while ((uint16_t)(TMOS_GetSystemClock() - start) < ticks) {
-        __asm volatile("nop");
-    }
-}
-
 /*********************************************************************
  * @fn      hidkbd_type_text
  *
- * @brief   Type a NUL-terminated ASCII string through the BLE HID
- *          keyboard.  Each character produces a press-report followed
- *          immediately by a release-report (all-zero).  Unmapped chars
- *          are skipped; callers should NOT free the buffer afterwards.
- *          Requires HID report notifications enabled (i.e. host is
- *          connected and the HID profile has been started).
+ * @brief   Schedule a NUL-terminated ASCII string to be typed through
+ *          the BLE HID keyboard asynchronously via START_TYPE_EVT.
+ *          The caller is NOT blocked - the string is copied into an
+ *          internal static buffer and each character is sent as:
+ *              press-report -> ~1.25ms -> release-report -> ~1.25ms.
+ *          A busy-flag is returned to callers: if a previous type is
+ *          still in flight the new string is DROPPED and 0 is returned.
+ *          Actual character count sent is reported via
+ *          hidkbd_type_progress() once hidkbd_type_busy() returns 0.
  *
- * @param   text   NUL-terminated ASCII string.
- *
- * @return  number of characters successfully typed (>=0).
+ * @return  number of characters scheduled (>=0).  If ==0 either the
+ *          input was empty/NULL or a previous job is still running.
  */
 int hidkbd_type_text(const char *text)
 {
     if (!text) return 0;
+    if (s_type_busy) return 0;   /* in-flight, cannot accept */
 
-    int typed = 0;
-    for (const char *p = text; *p; p++) {
-        uint8_t mod, kc;
-        if (ascii_to_hid(*p, &mod, &kc) != 0) {
-            continue;                /* unsupported, skip */
-        }
-        hidEmuSendKbdReport(mod, kc);           /* press */
-        hidkbd_busy_ticks(1);                   /* ~0.6ms */
-        hidEmuSendKbdReport(0, 0);              /* release all */
-        hidkbd_busy_ticks(1);
-        typed++;
-    }
-    return typed;
+    uint16_t len = 0;
+    while (text[len] && len < (TYPE_BUF_SIZE - 1)) len++;
+    if (len == 0) return 0;
+
+    memcpy(s_type_buf, text, len);
+    s_type_buf[len] = '\0';
+
+    /* Arm state machine from the start */
+    s_type_len   = len;
+    s_type_idx   = 0;
+    s_type_step  = TYPE_STEP_PRESS;
+    s_type_typed = 0;
+    s_type_busy  = 1;
+
+    /* Fire first event immediately (TMOS). */
+    tmos_set_event(hidEmuTaskId, START_TYPE_EVT);
+
+    return (int)len;
+}
+
+/* ---- Public status accessors ---------------------------------------- */
+
+int hidkbd_type_busy(void)
+{
+    return (int)s_type_busy;
+}
+
+int hidkbd_type_progress(void)
+{
+    return s_type_typed;
 }
 
 /*********************************************************************

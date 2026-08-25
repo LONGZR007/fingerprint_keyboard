@@ -13,6 +13,7 @@
 
 #include "CH58x_common.h"
 #include "usb_composite.h"
+#include <string.h>
 
 /*********************************************************************
  * DMA buffers (4-byte aligned)
@@ -135,6 +136,34 @@ static uint8_t        ep0_in_zlp;
 #define CDC_RX_SIZE 64
 static uint8_t         cdc_rx_buf[CDC_RX_SIZE];
 static volatile uint16_t cdc_rx_len;
+
+/* ---- Async USB HID string-type state machine ----
+ *
+ * 与 BLE hidkbd_type_text 状态机一致：
+ *   PRESS -> WAIT_PRESS -> RELEASE -> WAIT_RELEASE -> NEXT -> PRESS
+ * 每次 usb_composite_task() 调用最多推进一步，绝不阻塞。
+ * 两个 WAIT 阶段靠系统时钟轮询 ~1ms 间隔（全速 USB 典型 bulk 节奏）。
+ * 不使用 busy-loop 的 DelayUs，避免抢占 BLE 调度。 */
+#define USB_TYPE_BUF_SIZE  128
+#define USB_STEP_PRESS     0
+#define USB_STEP_WAIT_PRESS 1
+#define USB_STEP_RELEASE   2
+#define USB_STEP_WAIT_REL  3
+#define USB_STEP_NEXT      4
+#define USB_STEP_DELAY_US  1200UL
+
+static char     s_ut_buf[USB_TYPE_BUF_SIZE];
+static uint16_t s_ut_len    = 0;
+static uint16_t s_ut_idx    = 0;
+static uint8_t  s_ut_step   = USB_STEP_PRESS;
+static uint8_t  s_ut_mod    = 0;
+static uint8_t  s_ut_kc     = 0;
+static uint8_t  s_ut_supp   = 0;
+static volatile uint8_t s_ut_busy = 0;
+static int       s_ut_typed = 0;
+static uint32_t  s_ut_deadline = 0;   /* microsecond deadline via GetSysClock */
+
+static int usb_ascii_to_hid(char ch, uint8_t *modifier, uint8_t *keycode);
 
 /*********************************************************************
  * Deferred IRQ event ring buffer (single producer: IRQ, single consumer: task)
@@ -558,8 +587,78 @@ void usb_composite_task(void)
             break;
         }
     }
+
+    /* ---- Async USB HID type state machine: 每次调用最多推一步 ---- */
+    if (s_ut_busy) {
+        uint32_t now = GetSysClock() / 1000UL;  /* us  */
+        switch (s_ut_step) {
+            case USB_STEP_PRESS: {
+                char ch = s_ut_buf[s_ut_idx];
+                uint8_t mod = 0, kc = 0;
+                if (usb_ascii_to_hid(ch, &mod, &kc) == 0) {
+                    s_ut_supp = 1;
+                    s_ut_mod  = mod;
+                    s_ut_kc   = kc;
+                    uint8_t *p = Ep1InBuffer;
+                    p[0]=mod; p[1]=0; p[2]=kc; p[3]=0; p[4]=0; p[5]=0; p[6]=0; p[7]=0;
+                    ep1_in_ready = 0;
+                    R8_UEP1_T_LEN = 8;
+                    R8_UEP1_CTRL = (R8_UEP1_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_ACK;
+                    s_ut_step = USB_STEP_WAIT_PRESS;
+                    s_ut_deadline = now + USB_STEP_DELAY_US;
+                } else {
+                    s_ut_supp = 0;
+                    s_ut_step = USB_STEP_NEXT;   /* skip unsupported char */
+                }
+                break;
+            }
+            case USB_STEP_WAIT_PRESS:
+                /* wait for IN-complete OR timeout to make sure host has
+                 * seen the press report before we release it */
+                if (ep1_in_ready && now >= s_ut_deadline) {
+                    /* release all keys */
+                    uint8_t *p = Ep1InBuffer;
+                    p[0]=0; p[1]=0; p[2]=0; p[3]=0; p[4]=0; p[5]=0; p[6]=0; p[7]=0;
+                    ep1_in_ready = 0;
+                    R8_UEP1_T_LEN = 8;
+                    R8_UEP1_CTRL = (R8_UEP1_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_ACK;
+                    s_ut_typed++;
+                    s_ut_step = USB_STEP_WAIT_REL;
+                    s_ut_deadline = now + USB_STEP_DELAY_US;
+                }
+                break;
+
+            case USB_STEP_WAIT_REL:
+                if (ep1_in_ready && now >= s_ut_deadline) {
+                    s_ut_step = USB_STEP_NEXT;
+                }
+                break;
+
+            case USB_STEP_NEXT:
+                s_ut_idx++;
+                if (s_ut_idx >= s_ut_len) {
+                    /* 全部完成 */
+                    s_ut_busy = 0;
+                    s_ut_step = USB_STEP_PRESS;
+                    s_ut_len = s_ut_idx = 0;
+                } else {
+                    s_ut_step = USB_STEP_PRESS;
+                }
+                break;
+
+            case USB_STEP_RELEASE:  /* 占位，未使用 */
+            default:
+                s_ut_step = USB_STEP_NEXT;
+                break;
+        }
+    }
 }
 
+/* ---- Internal helper: fire EP1 report (press or release) and wait until
+ *      the next usb_composite_task() cycle confirms it is out.
+ *      Note: `usb_hid_send_key` is kept for compatibility and still does
+ *      a *single character's* full press-release dance in one blocking
+ *      call, but usb_hid_send_text() now uses the async state machine. */
 void usb_hid_send_key(uint8_t modifier, uint8_t keycode)
 {
     uint8_t *p = Ep1InBuffer;
@@ -600,7 +699,7 @@ void usb_hid_send_key(uint8_t modifier, uint8_t keycode)
 
 #define HID_MOD_LSHIFT 0x02
 
-static int ascii_to_hid(char ch, uint8_t *modifier, uint8_t *keycode)
+static int usb_ascii_to_hid(char ch, uint8_t *modifier, uint8_t *keycode)
 {
     uint8_t mod = 0;
     uint8_t kc  = 0;
@@ -658,22 +757,36 @@ static int ascii_to_hid(char ch, uint8_t *modifier, uint8_t *keycode)
     return 0;
 }
 
+/* ---- Async USB text-type scheduler ---------------------------------------
+ *   不阻塞，立即返回。忙状态下重复调用直接丢弃返回 0。 ------------------- */
 int usb_hid_send_text(const char *text)
 {
-    int typed = 0;
-    uint8_t mod, kc;
-
     if (!text) return 0;
+    if (s_ut_busy) return 0;
 
-    for (const char *p = text; *p; p++) {
-        if (ascii_to_hid(*p, &mod, &kc) != 0) {
-            continue;   /* unsupported, skip */
-        }
-        usb_hid_send_key(mod, kc);
-        DelayUs(800);   /* small gap between keystrokes */
-        typed++;
-    }
-    return typed;
+    uint16_t len = 0;
+    while (text[len] && len < (USB_TYPE_BUF_SIZE - 1)) len++;
+    if (len == 0) return 0;
+
+    memcpy(s_ut_buf, text, len);
+    s_ut_buf[len] = '\0';
+
+    s_ut_len   = len;
+    s_ut_idx   = 0;
+    s_ut_step  = USB_STEP_PRESS;
+    s_ut_typed = 0;
+    s_ut_busy  = 1;
+    return (int)len;
+}
+
+int usb_hid_type_busy(void)
+{
+    return (int)s_ut_busy;
+}
+
+int usb_hid_type_progress(void)
+{
+    return s_ut_typed;
 }
 
 int usb_cdc_send(const uint8_t *buf, uint16_t len)

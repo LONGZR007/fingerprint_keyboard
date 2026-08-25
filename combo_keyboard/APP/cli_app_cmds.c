@@ -213,8 +213,11 @@ static int cmd_type(int argc, char *argv[])
                   "           type aB3\r\n"
                   "           type hello world\r\n"
                   "           type \"passw0rd!\"\r\n"
-                  "         channel: %s (use 'channel' cmd to change)\r\n",
-                  keyboard_channel_name(keyboard_get_channel()));
+                  "         channel: %s (use 'channel' cmd to change)\r\n"
+                  "         progress: %d sent, busy=%s\r\n",
+                  keyboard_channel_name(keyboard_get_channel()),
+                  keyboard_type_progress(),
+                  keyboard_type_busy() ? "yes" : "no");
         return 0;
     }
     /* Rejoin argv[1..argc-1] back into one string with single spaces,
@@ -232,9 +235,23 @@ static int cmd_type(int argc, char *argv[])
     }
     s_line[n] = '\0';
 
-    int typed = keyboard_type(s_line);
-    cli_print("  typed %d char(s) of %d via %s: \"%s\"\r\n",
-              typed, n, keyboard_channel_name(keyboard_get_channel()), s_line);
+    if (keyboard_type_busy()) {
+        cli_print("  BUSY: previous type still in flight (%d/%d done via %s)\r\n",
+                  keyboard_type_progress(), n,
+                  keyboard_channel_name(keyboard_get_channel()));
+        return -1;
+    }
+
+    int scheduled = keyboard_type(s_line);
+    if (scheduled > 0) {
+        cli_print("  scheduled %d char(s) via %s: \"%s\"\r\n"
+                  "  (call 'type' with no args to check progress)\r\n",
+                  scheduled,
+                  keyboard_channel_name(keyboard_get_channel()), s_line);
+    } else {
+        cli_print("  schedule FAILED (empty input or queue busy)\r\n");
+        return -1;
+    }
     return 0;
 }
 

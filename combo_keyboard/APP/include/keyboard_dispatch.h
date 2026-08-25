@@ -16,25 +16,33 @@ typedef enum {
 } kbd_channel_t;
 
 /*
- * 统一键盘发送接口：按 channel 标志同时向指定通道发送 ASCII 字符串。
- * 返回成功发送的字符数（取两个通道中较小值，因为不同通道可能跳过不同字符）。
+ * 统一键盘发送接口（异步）：按 channel 标志同时向指定通道调度 ASCII
+ * 字符串发送。实际按键报告在 BLE TMOS 事件 / USB 主循环 task 中推进，
+ * 调用者绝不阻塞。
+ *
+ * 返回本次实际“成功入队”的字符数（>=0）：
+ *   - 返回 0 表示：输入空 / 上一次调度仍在执行 / 所选通道无可用
+ *   - 返回 >0 表示：至少一个请求通道已成功入队
+ *
+ * 注意：调度后可通过 keyboard_type_busy() / keyboard_type_progress()
+ * 查询执行状态；两通道的执行节奏不同，最终 progress 为两者较小值。
  */
-int keyboard_type_text(const char *text, kbd_channel_t ch);
+int  keyboard_type_text(const char *text, kbd_channel_t ch);
 
-/*
- * 使用当前默认通道发送（由 keyboard_set_channel 设置）。
- */
-int keyboard_type(const char *text);
+/* 使用当前默认通道发送（由 keyboard_set_channel 设置）。 */
+int  keyboard_type(const char *text);
 
-/*
- * 设置 / 获取当前默认发送通道。
- */
+/* 设置 / 获取当前默认发送通道。 */
 void keyboard_set_channel(kbd_channel_t ch);
 kbd_channel_t keyboard_get_channel(void);
 
-/*
- * 通道名称转换（用于 CLI 显示）。
- */
+/* 所有启用通道都发送完成时返回 0，否则返回 1。 */
+int  keyboard_type_busy(void);
+
+/* 返回当前正在发送的字符串中，已成功发出的字符数（以进度较慢的通道为准）。 */
+int  keyboard_type_progress(void);
+
+/* 通道名称转换（用于 CLI 显示）。 */
 const char *keyboard_channel_name(kbd_channel_t ch);
 
 #ifdef __cplusplus
