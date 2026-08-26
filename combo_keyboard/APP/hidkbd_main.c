@@ -19,6 +19,9 @@
 #include "cli.h"
 #include "cli_uart.h"
 #include "usb_composite.h"
+#include "fp_uart.h"
+#include "fp_proto.h"
+#include "fp_sm.h"
 
 /*********************************************************************
  * GLOBAL TYPEDEFS
@@ -63,6 +66,41 @@ static void Cli_Init(void)
     cli_print_prompt();
     /* kick off periodic drain */
     tmos_start_task(cli_task_id, CLI_TASK_EVT_POLL, CLI_POLL_MS);
+}
+
+/* --------------------------------------------------------------------------
+ * Fingerprint module integration (TMOS task, 5 ms poll interval)
+ * ------------------------------------------------------------------------ */
+#define FP_TASK_EVT_POLL     0x0001
+#define FP_POLL_MS           5
+static uint8_t fp_task_id = INVALID_TASK_ID;
+extern void fp_app_cmds_init(void);  /* 定义在 fp_app_cmds.c */
+
+static uint16_t FpTask_ProcessEvent(uint8_t task_id, uint16_t events)
+{
+    (void)task_id;
+    if (events & FP_TASK_EVT_POLL) {
+        /* 串口缓冲出队 -> 协议解析 -> 状态机推进 */
+        fp_uart_drain();
+        fp_proto_task();
+        fp_sm_task();
+        /* 重新启动周期任务, 实现 5ms 周期调用 */
+        tmos_start_task(fp_task_id, FP_TASK_EVT_POLL, FP_POLL_MS);
+        return (uint16_t)(events ^ FP_TASK_EVT_POLL);
+    }
+    return 0;
+}
+
+void Fp_Init(void)
+{
+    fp_uart_init();        /* 初始化 UART3 HAL */
+    fp_proto_init();       /* 初始化协议解析层 */
+    fp_sm_init();          /* 初始化状态机 */
+    fp_app_cmds_init();    /* 注册 CLI 指纹命令和通知回调 */
+    /* 注册 TMOS 周期任务处理函数 */
+    fp_task_id = TMOS_ProcessEventRegister(FpTask_ProcessEvent);
+    /* 启动周期任务, 5ms 间隔 */
+    tmos_start_task(fp_task_id, FP_TASK_EVT_POLL, FP_POLL_MS);
 }
 
 /*********************************************************************
@@ -112,6 +150,7 @@ int main(void)
     HidDev_Init();
     HidEmu_Init();
     Cli_Init();
+    Fp_Init();               /* 指纹模组驱动初始化 */
     /* USB composite device (HID keyboard + CDC serial) */
     usb_composite_init();
     cli_print("USB composite device initialized.\r\n");
