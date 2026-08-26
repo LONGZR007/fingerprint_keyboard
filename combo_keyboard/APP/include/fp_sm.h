@@ -68,6 +68,16 @@ typedef enum {
 #define FP_WAIT_TIMEOUT_MS    5000
 #endif
 
+/* 等待应答超时(ms) */
+#ifndef FP_WAIT_ENROLL_TIMEOUT_MS
+#define FP_WAIT_ENROLL_TIMEOUT_MS    (1000 * 13)
+#endif
+
+/* 等待应答超时(ms) */
+#ifndef FP_WAIT_VERIFY_TIMEOUT_MS
+#define FP_WAIT_VERIFY_TIMEOUT_MS    (1000 * 13)
+#endif
+
 /* 1:N 全库搜索的 TargetID */
 #define FP_SEARCH_ALL         0xFFFF
 
