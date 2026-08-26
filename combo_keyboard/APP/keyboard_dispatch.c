@@ -10,7 +10,7 @@
 #include "usb_composite.h"
 
 /* 当前默认通道，上电默认 BLE + USB 同时发送 */
-static kbd_channel_t s_default_channel = KBD_CH_BOTH;
+static kbd_channel_t s_default_channel = KBD_CH_BLE;
 
 /* 记住最近一次通过 keyboard_type_text / keyboard_type 激活的通道掩码，
  * 便于 busy()/progress() 只统计“本次被要求的那些通道”。 */

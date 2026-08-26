@@ -182,7 +182,7 @@ static uint16_t hidEmuConnHandle = GAP_CONNHANDLE_INIT;
 #define TYPE_STEP_PRESS      0
 #define TYPE_STEP_RELEASE    1
 #define TYPE_STEP_NEXT       2
-#define TYPE_TICK_STEP       2   /* 每 step 之间的 tick 间隔 (~1.25ms) */
+#define TYPE_TICK_STEP       50   /* 每 step 之间的 tick 间隔 (~1.25ms) */
 
 static char     s_type_buf[TYPE_BUF_SIZE];
 static uint16_t s_type_len    = 0;
@@ -748,10 +748,10 @@ static uint8_t hidEmuRptCB(uint8_t id, uint8_t type, uint16_t uuid,
         status = Hid_GetParameter(id, type, uuid, pLen, pData);
     }
     // notifications enabled
-    else if(oper == HID_DEV_OPER_ENABLE)
-    {
-        tmos_start_task(hidEmuTaskId, START_REPORT_EVT, 500);
-    }
+    // else if(oper == HID_DEV_OPER_ENABLE)
+    // {
+    //     tmos_start_task(hidEmuTaskId, START_REPORT_EVT, 500);
+    // }
     return status;
 }
 
