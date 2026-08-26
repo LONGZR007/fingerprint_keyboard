@@ -49,10 +49,10 @@ static void on_packet_cb(uint8_t pid, const uint8_t *data, uint16_t len) {
 
 /* ===== 等待应答的辅助宏（在 protothread 内使用） ===== */
 /* 等待 s_rx.ready 或超时, 返回 PT_WAITING 让出 */
-#define FP_WAIT_RESPONSE(pt) \
+#define FP_WAIT_RESPONSE(pt, timeout_ms) \
     do { \
         s_wait_start = s_tick; \
-        PT_WAIT_UNTIL((pt), s_rx.ready || (s_tick - s_wait_start) > (FP_WAIT_TIMEOUT_MS / 5)); \
+        PT_WAIT_UNTIL((pt), s_rx.ready || (s_tick - s_wait_start) > (timeout_ms / 5)); \
         if (!s_rx.ready) { \
             if (s_notify) s_notify(FP_MSG_TIMEOUT, 0, 0); \
             s_state = FP_IDLE; \
@@ -81,7 +81,7 @@ static PT_THREAD(pt_enroll(struct pt *pt)) {
     /* 循环处理多步骤应答 */
     while (1) {
         s_rx.ready = FALSE;
-        FP_WAIT_RESPONSE(pt);
+        FP_WAIT_RESPONSE(pt, FP_WAIT_ENROLL_TIMEOUT_MS);
 
         /* 解析应答: data[0]=确认码, data[1]=步骤码, data[2]=Param2 */
         confirm = s_rx.data[0];
@@ -144,7 +144,7 @@ static PT_THREAD(pt_verify(struct pt *pt)) {
 
     while (1) {
         s_rx.ready = FALSE;
-        FP_WAIT_RESPONSE(pt);
+        FP_WAIT_RESPONSE(pt, FP_WAIT_VERIFY_TIMEOUT_MS);
 
         /* 应答格式: data[0]=确认码, data[1]=步骤, data[2..3]=PageID, data[4..5]=Score */
         confirm = s_rx.data[0];
@@ -193,7 +193,7 @@ static PT_THREAD(pt_delete(struct pt *pt)) {
     fp_uart_send(buf, pkt_len);
 
     s_rx.ready = FALSE;
-    FP_WAIT_RESPONSE(pt);
+    FP_WAIT_RESPONSE(pt, FP_WAIT_TIMEOUT_MS);
 
     if (s_rx.data[0] == 0x00) {
         if (s_notify) s_notify(FP_MSG_DELETE_OK, 0, 0);
@@ -216,7 +216,7 @@ static PT_THREAD(pt_clear(struct pt *pt)) {
     fp_uart_send(buf, pkt_len);
 
     s_rx.ready = FALSE;
-    FP_WAIT_RESPONSE(pt);
+    FP_WAIT_RESPONSE(pt, FP_WAIT_TIMEOUT_MS);
 
     if (s_rx.data[0] == 0x00) {
         if (s_notify) s_notify(FP_MSG_CLEAR_OK, 0, 0);
@@ -239,7 +239,7 @@ static PT_THREAD(pt_cancel(struct pt *pt)) {
     fp_uart_send(buf, pkt_len);
 
     s_rx.ready = FALSE;
-    FP_WAIT_RESPONSE(pt);
+    FP_WAIT_RESPONSE(pt, FP_WAIT_TIMEOUT_MS);
 
     /* 无论结果都回到 IDLE */
     if (s_notify) s_notify(FP_MSG_CANCELLED, 0, 0);

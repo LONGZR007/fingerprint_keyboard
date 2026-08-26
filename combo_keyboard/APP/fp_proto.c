@@ -93,6 +93,8 @@ void fp_proto_rx_byte(uint8_t b)
     /* 记录本次接收的活动时间戳 */
     s_last_tick = s_tick_counter;
 
+    // PRINT("FP_RX: %02X\n", b);
+
     switch (s_state) {
 
     case FP_ST_HEAD0:
@@ -135,12 +137,12 @@ void fp_proto_rx_byte(uint8_t b)
     case FP_ST_LEN_LO:
         s_pkt_len |= b;
         s_chk_sum += b;
-        /* 数据长度 = 包长度 - 3 (PID 1B + 校验和 2B) */
+        /* 数据长度 = 包长度 - 3 (data 1B + 校验和 2B) */
         if (s_pkt_len < 3) {
             fp_reset_state();       /* 非法长度 */
             break;
         }
-        s_data_len = (uint16_t)(s_pkt_len - 3);
+        s_data_len = (uint16_t)(s_pkt_len - 2);
         if (s_data_len > FP_MAX_DATA) {
             fp_reset_state();       /* 超出缓冲，丢弃 */
             break;
@@ -225,7 +227,7 @@ uint16_t fp_proto_checksum(const uint8_t *data, uint16_t len)
  * ===================================================================== */
 uint16_t fp_proto_build_cmd(uint8_t *buf, uint8_t cmd, const uint8_t *params, uint8_t param_len)
 {
-    uint16_t pkt_len = (uint16_t)(1 + 1 + param_len + 2);  /* PID + cmd + params + chk */
+    uint16_t pkt_len = (uint16_t)(1 + param_len + 2);  /* cmd + params + chk */
     uint16_t chk;
     uint16_t idx = 0;
 
