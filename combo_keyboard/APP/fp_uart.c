@@ -84,10 +84,10 @@ static uint16_t ring_push(const uint8_t *data, uint16_t len)
 static int ring_pop(void)
 {
     if (s_r_head == s_r_tail) return -1;
-    __disable_irq();
+    // __disable_irq();
     uint8_t b = s_ring[s_r_tail];
     s_r_tail = (uint16_t)(s_r_tail + 1) & RING_MASK;
-    __enable_irq();
+    // __enable_irq();
     return (int)b;
 }
 
@@ -190,10 +190,13 @@ uint16_t fp_uart_available(void)
 
 void fp_uart_send(const uint8_t *buf, uint16_t len)
 {
+    // PRINT("FP_TX: ");
     if (!s_ready || buf == NULL || len == 0) return;
     while (len--) {
         /* Wait until TX FIFO is not full. */
+        // PRINT("%02X ", *buf);
         while (U_R8(_TFC) == UART_FIFO_SIZE) { /* spin */ }
         U_SendByte(*buf++);
     }
+    // PRINT("\n");
 }

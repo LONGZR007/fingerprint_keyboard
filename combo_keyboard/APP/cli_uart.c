@@ -132,10 +132,10 @@ static uint16_t ring_push(const uint8_t *data, uint16_t len)
 static int ring_pop(void)
 {
     if (s_r_head == s_r_tail) return -1;
-    __disable_irq();
+    // __disable_irq();
     uint8_t b = s_ring[s_r_tail];
     s_r_tail = (uint16_t)(s_r_tail + 1) & RING_MASK;
-    __enable_irq();
+    // __enable_irq();
     return (int)b;
 }
 

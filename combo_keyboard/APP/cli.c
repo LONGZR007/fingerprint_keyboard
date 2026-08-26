@@ -234,10 +234,10 @@ int cli_task(void)
     if (s_ready) {
         /* Copy line out then immediately release producer slot */
         char line[CLI_LINE_MAX];
-        __disable_irq();
+        // __disable_irq();
         memcpy(line, s_ready_line, sizeof(line));
         s_ready = 0;
-        __enable_irq();
+        // __enable_irq();
 
         if (line[0]) {                               /* skip empty */
             find_and_run(line);
