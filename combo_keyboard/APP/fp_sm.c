@@ -139,7 +139,7 @@ static PT_THREAD(pt_verify(struct pt *pt)) {
     params[0] = FP_VERIFY_SCORE_LEVEL;
     params[1] = (uint8_t)(FP_SEARCH_ALL >> 8);    /* 0xFF */
     params[2] = (uint8_t)(FP_SEARCH_ALL & 0xFF);   /* 0xFF */
-    params[3] = 0x00;  /* Param: 要求返回步骤 */
+    params[3] = 0x04;  /* Param: 不要求返回步骤 */
     params[4] = 0x00;
     pkt_len = fp_proto_build_cmd(buf, CMD_AUTO_IDENTIFY, params, 5);
     fp_uart_send(buf, pkt_len);

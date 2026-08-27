@@ -53,9 +53,9 @@ typedef enum {
  *   bit3=1: 允许覆盖已有 ID
  *   bit4=0: 允许重复注册
  *   bit5=0: 每次采集后要求手指离开
- * 默认值 = (1<<0) | (1<<3) = 0x09 */
+ * 默认值 = (1<<0) */
 #ifndef FP_ENROLL_PARAM
-#define FP_ENROLL_PARAM       0x09
+#define FP_ENROLL_PARAM       0x01
 #endif
 
 /* 验证比对分数等级 1~5 */
