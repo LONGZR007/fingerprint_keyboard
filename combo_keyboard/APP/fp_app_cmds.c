@@ -175,7 +175,7 @@ static int cmd_fp(int argc, char *argv[])
         if (fp_sm_cancel()) {
             cli_print("  fp cancel sent\r\n");
         } else {
-            cli_print("  fp busy, cannot cancel\r\n");
+            cli_print("  fp idle, nothing to cancel\r\n");
         }
         return 0;
     }

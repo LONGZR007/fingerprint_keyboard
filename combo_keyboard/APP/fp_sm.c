@@ -249,22 +249,9 @@ static PT_THREAD(pt_cancel(struct pt *pt)) {
     PT_END(pt);
 }
 
-/* ===== 是否处于不可打断的操作中 ===== */
-/* VERIFY 可被打断 (注册/删除/清空/取消都会先抢占它), 故不算 busy */
-static BOOL fp_sm_busy(void) {
-    return (s_state == FP_ENROLL || s_state == FP_DELETE_ONE ||
-            s_state == FP_CLEAR_ALL || s_state == FP_CANCEL);
-}
-
 /* ===== 主任务函数：由主循环周期调用, 推进状态机 ===== */
 void fp_sm_task(void) {
     s_tick++;  /* 全局 tick 递增 (5ms周期) */
-
-    /* IDLE 状态: 自动启动验证 (开机默认 / 操作结束 / 超时后 均回到这里) */
-    if (s_state == FP_IDLE) {
-        s_state = FP_VERIFY;
-        PT_INIT(&s_pt);
-    }
 
     switch (s_state) {
     case FP_ENROLL:
@@ -283,15 +270,13 @@ void fp_sm_task(void) {
         PT_SCHEDULE(pt_cancel(&s_pt));
         break;
     default:
-        break;  /* 不会到达: IDLE 已在上面转为 VERIFY */
+        break;  /* IDLE, 不调度 */
     }
 }
 
 /* ===== 状态切换 API ===== */
-/* 注: VERIFY 状态可被打断 (回到默认验证前先执行请求的操作);
- * 仅当处于 ENROLL/DELETE/CLEAR/CANCEL 等不可打断的操作时拒绝。 */
 BOOL fp_sm_enroll(uint16_t page_id) {
-    if (fp_sm_busy()) {
+    if (s_state != FP_IDLE) {
         if (s_notify) s_notify(FP_MSG_BUSY, 0, 0);
         return FALSE;
     }
@@ -302,7 +287,7 @@ BOOL fp_sm_enroll(uint16_t page_id) {
 }
 
 BOOL fp_sm_verify(void) {
-    if (fp_sm_busy()) {
+    if (s_state != FP_IDLE) {
         if (s_notify) s_notify(FP_MSG_BUSY, 0, 0);
         return FALSE;
     }
@@ -312,7 +297,7 @@ BOOL fp_sm_verify(void) {
 }
 
 BOOL fp_sm_delete(uint16_t page_id) {
-    if (fp_sm_busy()) {
+    if (s_state != FP_IDLE) {
         if (s_notify) s_notify(FP_MSG_BUSY, 0, 0);
         return FALSE;
     }
@@ -323,7 +308,7 @@ BOOL fp_sm_delete(uint16_t page_id) {
 }
 
 BOOL fp_sm_clear(void) {
-    if (fp_sm_busy()) {
+    if (s_state != FP_IDLE) {
         if (s_notify) s_notify(FP_MSG_BUSY, 0, 0);
         return FALSE;
     }
@@ -333,7 +318,7 @@ BOOL fp_sm_clear(void) {
 }
 
 BOOL fp_sm_cancel(void) {
-    if (fp_sm_busy()) {
+    if (s_state != FP_IDLE) {
         if (s_notify) s_notify(FP_MSG_BUSY, 0, 0);
         return FALSE;
     }
