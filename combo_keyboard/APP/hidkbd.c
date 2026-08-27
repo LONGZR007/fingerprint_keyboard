@@ -184,16 +184,57 @@ static uint16_t hidEmuConnHandle = GAP_CONNHANDLE_INIT;
 #define TYPE_STEP_NEXT       2
 #define TYPE_TICK_STEP       50   /* 每 step 之间的 tick 间隔 (~1.25ms) */
 
-static char     s_type_buf[TYPE_BUF_SIZE];
-static uint16_t s_type_len    = 0;
-static uint16_t s_type_idx    = 0;
-static uint8_t  s_type_step   = TYPE_STEP_PRESS;
-static uint8_t  s_type_mod    = 0;
-static uint8_t  s_type_kc     = 0;
+/* 预解析的按键序列项: (HID modifier, HID keycode) */
+typedef struct {
+    uint8_t mod;
+    uint8_t kc;
+} kbd_seq_key_t;
+
+/* 特殊键名表: "enter" -> 回车, "esc" -> ESC ... 键名大小写不敏感 */
+typedef struct {
+    const char *name;
+    uint8_t     keycode;
+} hid_special_key_t;
+
+static const hid_special_key_t s_special_keys[] = {
+    { "enter",     0x28 },  /* Enter / Return      */
+    { "esc",       0x29 },  /* Escape              */
+    { "backspace", 0x2A },  /* Backspace           */
+    { "tab",       0x2B },  /* Tab                 */
+    { "space",     0x2C },  /* Space               */
+    { "capslock",  0x39 },  /* Caps Lock           */
+    { "insert",    0x49 },  /* Insert              */
+    { "home",      0x4A },  /* Home                */
+    { "pageup",    0x4B },  /* Page Up             */
+    { "delete",    0x4C },  /* Delete (Del)        */
+    { "end",       0x4D },  /* End                 */
+    { "pagedown",  0x4E },  /* Page Down           */
+    { "right",     0x4F },  /* Right Arrow         */
+    { "left",      0x50 },  /* Left Arrow          */
+    { "down",      0x51 },  /* Down Arrow          */
+    { "up",        0x52 },  /* Up Arrow            */
+    { "f1",        0x3A },  /* F1 ~ F12            */
+    { "f2",        0x3B },
+    { "f3",        0x3C },
+    { "f4",        0x3D },
+    { "f5",        0x3E },
+    { "f6",        0x3F },
+    { "f7",        0x40 },
+    { "f8",        0x41 },
+    { "f9",        0x42 },
+    { "f10",       0x43 },
+    { "f11",       0x44 },
+    { "f12",       0x45 },
+};
+
+#define SPECIAL_KEY_NUM (sizeof(s_special_keys) / sizeof(s_special_keys[0]))
+
+static kbd_seq_key_t s_key_seq[TYPE_BUF_SIZE];  /* 入队时预解析的按键序列 */
+static uint16_t      s_key_len = 0;
+static uint16_t      s_key_idx = 0;
+static uint8_t       s_type_step   = TYPE_STEP_PRESS;
 static volatile uint8_t s_type_busy = 0;
 static int           s_type_typed = 0;
-/* 当前字符是否为已支持字符（跳过的字符直接走 STEP_NEXT） */
-static uint8_t  s_type_supp = 0;
 
 /*********************************************************************
  * LOCAL FUNCTIONS
@@ -358,13 +399,13 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
         return (events ^ START_REPORT_EVT);
     }
 
-    /* ---- Async HID string-type state machine ----
+    /* ---- Async HID key-sequence type state machine ----
      *
-     * 每个字符推进 3 个 event（共 ~3.75ms）：
+     * 文本在入队时已解析为按键序列 s_key_seq（见 hidkbd_parse），
+     * 每个按键推进 3 个 event（共 ~3.75ms）：
      *   PRESS (EVT)   → send press, 2 tick → RELEASE
      *   RELEASE (EVT) → send 0x00 release, 2 tick → NEXT
-     *   NEXT (EVT)    → idx++, 0 tick → PRESS of next char
-     * 若字符不支持，PRESS 阶段直接跳到 NEXT，不发空报告。
+     *   NEXT (EVT)    → idx++, 0 tick → PRESS of next key
      *
      * 绝不在此 busy-wait；所有推进由 tmos 定时事件驱动，
      * 保证 BLE 协议栈连接事件/通知队列有充分调度窗口。 */
@@ -375,39 +416,28 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
         }
         switch (s_type_step) {
             case TYPE_STEP_PRESS: {
-                char ch = s_type_buf[s_type_idx];
-                uint8_t mod = 0, kc = 0;
-                if (ascii_to_hid(ch, &mod, &kc) == 0) {
-                    s_type_supp = 1;
-                    s_type_mod  = mod;
-                    s_type_kc   = kc;
-                    hidEmuSendKbdReport(mod, kc);
-                    s_type_step = TYPE_STEP_RELEASE;
-                    tmos_start_task(hidEmuTaskId, START_TYPE_EVT, TYPE_TICK_STEP);
-                } else {
-                    /* unsupported -> skip to next char immediately */
-                    s_type_supp = 0;
-                    s_type_step = TYPE_STEP_NEXT;
-                    tmos_start_task(hidEmuTaskId, START_TYPE_EVT, 0);
-                }
+                /* 按键码已在入队时预解析（含特殊键/转义），直接发送 */
+                uint8_t mod = s_key_seq[s_key_idx].mod;
+                uint8_t kc  = s_key_seq[s_key_idx].kc;
+                hidEmuSendKbdReport(mod, kc);
+                s_type_step = TYPE_STEP_RELEASE;
+                tmos_start_task(hidEmuTaskId, START_TYPE_EVT, TYPE_TICK_STEP);
                 break;
             }
             case TYPE_STEP_RELEASE:
-                if (s_type_supp) {
-                    hidEmuSendKbdReport(0, 0);
-                    s_type_typed++;
-                }
+                hidEmuSendKbdReport(0, 0);
+                s_type_typed++;
                 s_type_step = TYPE_STEP_NEXT;
                 tmos_start_task(hidEmuTaskId, START_TYPE_EVT, TYPE_TICK_STEP);
                 break;
 
             case TYPE_STEP_NEXT:
-                s_type_idx++;
-                if (s_type_idx >= s_type_len) {
+                s_key_idx++;
+                if (s_key_idx >= s_key_len) {
                     /* 全部发送完成 */
                     s_type_busy = 0;
                     s_type_step = TYPE_STEP_PRESS;
-                    s_type_len = s_type_idx = 0;
+                    s_key_len = s_key_idx = 0;
                 } else {
                     s_type_step = TYPE_STEP_PRESS;
                     tmos_start_task(hidEmuTaskId, START_TYPE_EVT, 0);
@@ -552,19 +582,127 @@ static int ascii_to_hid(char ch, uint8_t *modifier, uint8_t *keycode)
 }
 
 /*********************************************************************
+ * @fn      hid_special_key_lookup
+ *
+ * @brief   在特殊键名表中查找 "name" token（大小写不敏感）。
+ *          命中则回填 HID 键码并返回 0，否则返回 -1。
+ */
+static int hid_special_key_lookup(const char *name, uint16_t len, uint8_t *keycode)
+{
+    uint16_t i;
+    for (i = 0; i < SPECIAL_KEY_NUM; i++) {
+        const char *n = s_special_keys[i].name;
+        uint16_t j;
+        for (j = 0; j < len; j++) {
+            char a = name[j];
+            char b = n[j];
+            if (b == '\0') break;              /* 表项比 token 短 */
+            if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+            if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+            if (a != b) break;
+        }
+        if (j == len && n[j] == '\0') {        /* 完全匹配 */
+            *keycode = s_special_keys[i].keycode;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/*********************************************************************
+ * @fn      hidkbd_parse
+ *
+ * @brief   把文本解析为 HID 按键序列 (modifier, keycode)。
+ *
+ *          语法规则：
+ *            - 普通字符: ascii_to_hid 一对一转换；
+ *            - "name":   特殊键 token，如 "enter" -> 回车、"esc" -> ESC、
+ *                        "f1"~"f12"、"tab"/"space"/方向键等，键名不区分大小写；
+ *            - \" 和 \\: 转义符，按单个字面量字符处理（\"enter\" 会按
+ *                        普通文本 enter 发送，不会被当作特殊键）；
+ *            - 其他 \x:   保持原样按普通字符发送；
+ *            - 无法转换/不支持的字符: 跳过不发送。
+ *
+ * @param   text - 待解析的 NUL 结尾字符串
+ * @param   seq  - 输出按键序列缓冲
+ * @param   max  - 序列缓冲容量上限
+ *
+ * @return  生成的按键数（0 表示无可发送内容）。
+ */
+static uint16_t hidkbd_parse(const char *text, kbd_seq_key_t *seq, uint16_t max)
+{
+    uint16_t n = 0;
+    const char *p = text;
+
+    while (*p && n < max) {
+        /* 转义符: 仅 " 和 \ 有转义语义，其余 \x 保持原样 */
+        if (*p == '\\' && (p[1] == '"' || p[1] == '\\')) {
+            uint8_t mod = 0, kc = 0;
+            if (ascii_to_hid(p[1], &mod, &kc) == 0) {
+                seq[n].mod = mod;
+                seq[n].kc  = kc;
+                n++;
+            }
+            p += 2;
+            continue;
+        }
+
+        /* 特殊键 token: "name" */
+        if (*p == '"') {
+            const char *start = p + 1;
+            const char *q     = start;
+            while (*q && *q != '"') q++;
+            if (*q == '"' && q != start) {
+                uint8_t kc;
+                if (hid_special_key_lookup(start, (uint16_t)(q - start), &kc) == 0) {
+                    seq[n].mod = 0;
+                    seq[n].kc  = kc;
+                    n++;
+                    p = q + 1;
+                    continue;
+                }
+            }
+            /* 不是特殊键（或未闭合）: 引号按普通字符发送 */
+            {
+                uint8_t mod = 0, kc = 0;
+                if (ascii_to_hid('"', &mod, &kc) == 0) {
+                    seq[n].mod = mod;
+                    seq[n].kc  = kc;
+                    n++;
+                }
+                p++;
+                continue;
+            }
+        }
+
+        /* 普通字符 */
+        {
+            uint8_t mod = 0, kc = 0;
+            if (ascii_to_hid(*p, &mod, &kc) == 0) {
+                seq[n].mod = mod;
+                seq[n].kc  = kc;
+                n++;
+            }
+            p++;
+        }
+    }
+    return n;
+}
+
+/*********************************************************************
  * @fn      hidkbd_type_text
  *
  * @brief   Schedule a NUL-terminated ASCII string to be typed through
  *          the BLE HID keyboard asynchronously via START_TYPE_EVT.
- *          The caller is NOT blocked - the string is copied into an
- *          internal static buffer and each character is sent as:
- *              press-report -> ~1.25ms -> release-report -> ~1.25ms.
- *          A busy-flag is returned to callers: if a previous type is
- *          still in flight the new string is DROPPED and 0 is returned.
- *          Actual character count sent is reported via
- *          hidkbd_type_progress() once hidkbd_type_busy() returns 0.
+ *          文本在入队时被 hidkbd_parse 预解析为 HID 按键序列
+ *          （普通字符一对一、"enter"/"esc" 等特殊键、\" 转义）。
+ *          The caller is NOT blocked. A busy-flag is returned to
+ *          callers: if a previous type is still in flight the new
+ *          string is DROPPED and 0 is returned.  Actual key count
+ *          sent is reported via hidkbd_type_progress() once
+ *          hidkbd_type_busy() returns 0.
  *
- * @return  number of characters scheduled (>=0).  If ==0 either the
+ * @return  number of keys scheduled (>=0).  If ==0 either the
  *          input was empty/NULL or a previous job is still running.
  */
 int hidkbd_type_text(const char *text)
@@ -572,24 +710,21 @@ int hidkbd_type_text(const char *text)
     if (!text) return 0;
     if (s_type_busy) return 0;   /* in-flight, cannot accept */
 
-    uint16_t len = 0;
-    while (text[len] && len < (TYPE_BUF_SIZE - 1)) len++;
-    if (len == 0) return 0;
-
-    memcpy(s_type_buf, text, len);
-    s_type_buf[len] = '\0';
+    /* 转换: 字符 -> 键盘码, 支持 "enter"/"esc" 特殊键与 \" 转义 */
+    uint16_t n = hidkbd_parse(text, s_key_seq, TYPE_BUF_SIZE);
+    if (n == 0) return 0;
 
     /* Arm state machine from the start */
-    s_type_len   = len;
-    s_type_idx   = 0;
-    s_type_step  = TYPE_STEP_PRESS;
+    s_key_len   = n;
+    s_key_idx   = 0;
+    s_type_step = TYPE_STEP_PRESS;
     s_type_typed = 0;
     s_type_busy  = 1;
 
     /* Fire first event immediately (TMOS). */
     tmos_set_event(hidEmuTaskId, START_TYPE_EVT);
 
-    return (int)len;
+    return (int)n;
 }
 
 /* ---- Public status accessors ---------------------------------------- */

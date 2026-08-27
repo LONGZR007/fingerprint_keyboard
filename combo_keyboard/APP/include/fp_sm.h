@@ -49,13 +49,13 @@ typedef enum {
 
 /* 注册 Param 位图:
  *   bit0=1: 采图成功后 LED 灭
- *   bit2=0: 要求返回关键步骤
+ *   bit2=1: 不要求返回关键步骤
  *   bit3=1: 允许覆盖已有 ID
  *   bit4=0: 允许重复注册
  *   bit5=0: 每次采集后要求手指离开
- * 默认值 = (1<<0) */
+ * 默认值 = (1<<0) | (1<<3) = 0x09 */
 #ifndef FP_ENROLL_PARAM
-#define FP_ENROLL_PARAM       0x01
+#define FP_ENROLL_PARAM       0x09
 #endif
 
 /* 验证比对分数等级 1~5 */
@@ -70,12 +70,12 @@ typedef enum {
 
 /* 等待应答超时(ms) */
 #ifndef FP_WAIT_ENROLL_TIMEOUT_MS
-#define FP_WAIT_ENROLL_TIMEOUT_MS    (1000 * 13)
+#define FP_WAIT_ENROLL_TIMEOUT_MS    (1000 * 20)
 #endif
 
 /* 等待应答超时(ms) */
 #ifndef FP_WAIT_VERIFY_TIMEOUT_MS
-#define FP_WAIT_VERIFY_TIMEOUT_MS    (1000 * 13)
+#define FP_WAIT_VERIFY_TIMEOUT_MS    (1000 * 20)
 #endif
 
 /* 1:N 全库搜索的 TargetID */

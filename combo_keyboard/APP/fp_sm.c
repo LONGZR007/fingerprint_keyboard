@@ -13,6 +13,7 @@
 #include <string.h>
 
 /* ===== 指令码定义 ===== */
+#define CMD_FINGER_PRESENT 0x01   /* 查询是否有手指: 确认码 0=有, 2=无, 其他=错误 */
 #define CMD_AUTO_ENROLL    0x31
 #define CMD_AUTO_IDENTIFY  0x32
 #define CMD_DELETE_CHAR    0x0C
@@ -57,7 +58,6 @@ static void on_packet_cb(uint8_t pid, const uint8_t *data, uint16_t len) {
         PT_WAIT_UNTIL((pt), s_rx.ready || (s_tick - s_wait_start) > (timeout_ms / 5)); \
         if (!s_rx.ready) { \
             if (s_notify) s_notify(FP_MSG_TIMEOUT, 0, 0); \
-            s_state = FP_IDLE; \
             PT_EXIT((pt)); \
         } \
     } while(0)
@@ -168,6 +168,8 @@ static PT_THREAD(pt_verify(struct pt *pt)) {
                 }
                 break;
             }
+        } else if (confirm == 0x26) {
+            break;    // 超时不通知
         } else {
             /* 失败: 0x09未搜到 / 0x17残留 / 0x24库空 等 */
             if (s_notify) s_notify(FP_MSG_VERIFY_FAIL, confirm, 0);
@@ -175,7 +177,23 @@ static PT_THREAD(pt_verify(struct pt *pt)) {
         }
     }
 
-    s_state = FP_IDLE;
+    // 等待手指离开: 循环发送 0x01 查询指令, 直到确认码 != 0
+    while (1) {
+        s_rx.ready = FALSE;
+        pkt_len = fp_proto_build_cmd(buf, CMD_FINGER_PRESENT, NULL, 0);
+        fp_uart_send(buf, pkt_len);
+
+        FP_WAIT_RESPONSE(pt, FP_WAIT_TIMEOUT_MS);
+
+        confirm = s_rx.data[0];
+        if (confirm != 0x00) {
+            /* 0x02=无手指, 其他=错误: 均视为手指已离开 */
+            break;
+        }
+        /* 0x00=手指仍在, 继续查询 */
+    }
+
+    // s_state = FP_IDLE;   // 这里不切换状态, 继续验证下一枚指纹
     PT_END(pt);
 }
 
@@ -318,10 +336,6 @@ BOOL fp_sm_clear(void) {
 }
 
 BOOL fp_sm_cancel(void) {
-    if (s_state != FP_IDLE) {
-        if (s_notify) s_notify(FP_MSG_BUSY, 0, 0);
-        return FALSE;
-    }
     s_state = FP_CANCEL;
     PT_INIT(&s_pt);
     return TRUE;
@@ -337,7 +351,7 @@ void fp_sm_set_notify_cb(fp_notify_cb_t cb) {
 
 /* ===== 初始化 ===== */
 void fp_sm_init(void) {
-    s_state = FP_IDLE;
+    s_state = FP_VERIFY;
     s_notify = NULL;
     s_target_id = 0;
     s_tick = 0;
