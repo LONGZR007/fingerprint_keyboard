@@ -1,11 +1,7 @@
 /********************************** (C) COPYRIGHT *******************************
  * File Name          : cli.c
- * Description        : Lightweight CLI core:
- *                      - line buffer with backspace editing & echo
- *                      - argc/argv tokenizer (splits on spaces/tabs)
- *                      - command lookup & dispatch
- *                      - UART-agnostic: UART HAL provides cli_uart_putc /
- *                        cli_uart_send; bytes are fed in via cli_rx_byte()
+ * Description        : Enhanced Lightweight CLI core with Tab completion
+ *                      and command history.
  *******************************************************************************/
 #include "cli.h"
 
@@ -14,31 +10,45 @@
 #include <string.h>
 #include <ctype.h>
 
-/* RISC-V PFIC interrupt control (shared across CH58x core_riscv.h) */
+/* RISC-V PFIC interrupt control */
 #ifndef __disable_irq
 #define __disable_irq()  __asm volatile("csrci mstatus, 0x8")
 #define __enable_irq()   __asm volatile("csrsi mstatus, 0x8")
 #endif
 
-/* --------------------------- internal state ------------------------------ */
+/* --------------------------- Configuration & State ------------------------- */
+
+// Command and history limits
+#ifndef CLI_HISTORY_MAX
+#define CLI_HISTORY_MAX     8
+#endif
 
 static cli_cmd_t  s_cmds[CLI_CMD_MAX];
 static uint8_t    s_cmd_count;
 
-/* Input line being edited. Kept as NUL-terminated C string as we build it. */
+/* Input line state */
 static char       s_line[CLI_LINE_MAX];
-static uint16_t   s_line_len;            /* current used chars excl NUL     */
+static uint16_t   s_line_len;
+static uint16_t   s_cursor_pos;            // Current cursor position for line editing
 
-/* Output scratch buffer used by cli_print (vprintf -> this -> uart send) */
+/* History buffer (circular buffer) */
+static char       s_history_buf[CLI_HISTORY_MAX][CLI_LINE_MAX];
+static int8_t     s_history_idx = -1;      // Index of the currently displayed history command
+static uint8_t    s_history_count = 0;     // Total number of commands in history
+
+/* Input state machine for handling escape sequences (arrow keys) */
+typedef enum {
+    CLI_INPUT_NORMAL,
+    CLI_INPUT_WAIT_SPEC_KEY, // Received ESC (0x1b)
+    CLI_INPUT_WAIT_FUNC_KEY, // Received ESC [ (0x5b)
+} cli_input_state_t;
+
+static cli_input_state_t s_input_state = CLI_INPUT_NORMAL;
+
+/* Output and RX state */
 static char       s_txbuf[CLI_LINE_MAX];
-
-/* When a full line is received we copy it here so new input can start
- * immediately; cli_task() consumes s_ready_line. */
 static char       s_ready_line[CLI_LINE_MAX];
-static volatile uint8_t s_ready;        /* 1 when a complete line is ready */
-
-/* For CRLF / LFCR collapsing in cli_rx_byte() (scope moved up so else
- * branch can reference it). */
+static volatile uint8_t s_ready;
 static uint8_t    s_last_was_eol;
 
 /* ------------------------- weak HAL defaults ----------------------------- */
@@ -65,10 +75,127 @@ static void tx_str(const char *s)
     tx_raw(s, (uint16_t)strlen(s));
 }
 
-/* Backspace cursor 1 char left using BS-SPACE-BS (works on dumb terminals). */
+/* Moves cursor back one position, prints space, moves cursor back again. */
 static void echo_backspace(void)
 {
     tx_raw("\b \b", 3);
+}
+
+/* Clears the entire line and moves cursor to the beginning. */
+static void clear_line_and_home(void)
+{
+    tx_raw("\r\033[K", 4); // \r: Carriage Return, \033[K: Erase to End of Line
+}
+
+/* --------------------------- history & completion ------------------------ */
+
+static void cli_history_add(const char *cmd)
+{
+    if (strlen(cmd) == 0) return;
+
+    // Shift history down to make room for the new command at the top
+    if (s_history_count == CLI_HISTORY_MAX) {
+        // Buffer is full, shift all commands down
+        for (int i = CLI_HISTORY_MAX - 1; i > 0; i--) {
+            strcpy(s_history_buf[i], s_history_buf[i - 1]);
+        }
+    } else {
+        // Buffer not full, shift existing commands down
+        for (int i = s_history_count; i > 0; i--) {
+            strcpy(s_history_buf[i], s_history_buf[i - 1]);
+        }
+        s_history_count++;
+    }
+    strcpy(s_history_buf[0], cmd);
+    s_history_idx = -1; // Reset history index when a new command is entered
+}
+
+static void cli_history_recall(int8_t dir)
+{
+    if (s_history_count == 0) return;
+
+    int8_t new_idx = s_history_idx + dir;
+
+    // Check bounds
+    if (new_idx < -1) new_idx = -1; // -1 means show current (empty) line
+    if (new_idx >= s_history_count) new_idx = s_history_count - 1;
+
+    if (new_idx != s_history_idx) {
+        s_history_idx = new_idx;
+        clear_line_and_home();
+        cli_print_prompt();
+
+        if (s_history_idx == -1) {
+            // Show empty line
+            s_line_len = 0;
+            s_cursor_pos = 0;
+            s_line[0] = '\0';
+        } else {
+            // Show historical command
+            strcpy(s_line, s_history_buf[s_history_idx]);
+            s_line_len = strlen(s_line);
+            s_cursor_pos = s_line_len;
+            tx_str(s_line);
+        }
+    }
+}
+
+static void cli_tab_complete(void)
+{
+    int matches = 0;
+    const char *match_cmd = NULL;
+
+    // Find the last word in the buffer to use as the prefix for completion
+    char *prefix_start = s_line;
+    for (int i = s_cursor_pos - 1; i >= 0; i--) {
+        if (s_line[i] == ' ' || s_line[i] == '\t') {
+            prefix_start = &s_line[i + 1];
+            break;
+        }
+    }
+    uint16_t prefix_len = s_cursor_pos - (prefix_start - s_line);
+
+    // 1. Find matches
+    for (uint8_t i = 0; i < s_cmd_count; i++) {
+        if (strncmp(prefix_start, s_cmds[i].name, prefix_len) == 0) {
+            matches++;
+            match_cmd = s_cmds[i].name;
+        }
+    }
+
+    if (matches == 1) {
+        // 2. Single match: complete the word
+        const char *suffix = match_cmd + prefix_len;
+        uint16_t suffix_len = strlen(suffix);
+
+        // Make space for the new characters
+        memmove(s_line + s_cursor_pos + suffix_len, s_line + s_cursor_pos, s_line_len - s_cursor_pos + 1);
+        // Insert the suffix
+        memcpy(s_line + s_cursor_pos, suffix, suffix_len);
+
+        s_line_len += suffix_len;
+        s_cursor_pos += suffix_len;
+
+        // Echo the completed part
+        tx_raw(suffix, suffix_len);
+    } else if (matches > 1) {
+        // 3. Multiple matches: list them
+        tx_raw("\r\n", 2);
+        for (uint8_t i = 0; i < s_cmd_count; i++) {
+            if (strncmp(prefix_start, s_cmds[i].name, prefix_len) == 0) {
+                tx_str(s_cmds[i].name);
+                tx_raw("  ", 2);
+            }
+        }
+        // Redraw prompt and current line
+        tx_raw("\r\n", 2);
+        cli_print_prompt();
+        tx_raw(s_line, s_line_len);
+        // Move cursor back to its original position
+        for (uint16_t i = 0; i < s_line_len - s_cursor_pos; i++) {
+            tx_raw("\b", 1);
+        }
+    }
 }
 
 /* --------------------------- public API ---------------------------------- */
@@ -77,8 +204,11 @@ void cli_init(void)
 {
     s_cmd_count = 0;
     s_line_len  = 0;
+    s_cursor_pos = 0;
     s_line[0]   = 0;
     s_ready     = 0;
+    s_history_idx = -1;
+    s_history_count = 0;
     memset(s_cmds, 0, sizeof(s_cmds));
 }
 
@@ -101,84 +231,134 @@ int cli_register_cmds(const cli_cmd_t *table)
         if (cli_register_cmd(table->name, table->handler, table->help) == 0) {
             added++;
         } else {
-            return -1;                /* table overflow, stop early */
+            return -1;
         }
     }
     return added;
 }
 
-/* Called from ISR or task context. Lockless single-producer/single-consumer
- * since only one ISR feeds bytes and one task drains s_ready. */
 int cli_rx_byte(uint8_t b)
 {
     char c = (char)b;
 
-    /* Backspace / DEL (0x7F) */
-    if (c == '\b' || c == 0x7F) {
-        if (s_line_len > 0) {
-            s_line_len--;
-            s_line[s_line_len] = 0;
-            echo_backspace();
+    // --- State Machine for Special Keys ---
+    if (s_input_state != CLI_INPUT_NORMAL) {
+        if (s_input_state == CLI_INPUT_WAIT_SPEC_KEY) {
+            if (c == 0x5b) { // '['
+                s_input_state = CLI_INPUT_WAIT_FUNC_KEY;
+            } else {
+                s_input_state = CLI_INPUT_NORMAL;
+            }
+            return 0;
+        } else if (s_input_state == CLI_INPUT_WAIT_FUNC_KEY) {
+            s_input_state = CLI_INPUT_NORMAL;
+
+            if (c == 0x41) { // Up Arrow
+                cli_history_recall(1);
+                return 0;
+            } else if (c == 0x42) { // Down Arrow
+                cli_history_recall(-1);
+                return 0;
+            } else if (c == 0x43) { // Right Arrow
+                if (s_cursor_pos < s_line_len) {
+                    tx_raw(&s_line[s_cursor_pos], 1);
+                    s_cursor_pos++;
+                }
+                return 0;
+            } else if (c == 0x44) { // Left Arrow
+                if (s_cursor_pos > 0) {
+                    tx_raw("\b", 1);
+                    s_cursor_pos--;
+                }
+                return 0;
+            }
+            return 0;
         }
-        return (int)b;
     }
 
-    /* CR / LF -> end of line */
+    // --- Handle Normal Keys ---
+
+    if (c == 0x1b) { // ESC
+        s_input_state = CLI_INPUT_WAIT_SPEC_KEY;
+        return 0;
+    }
+
+    if (c == '\t') { // Tab
+        cli_tab_complete();
+        return 0;
+    }
+
+    if (c == '\b' || c == 0x7F) { // Backspace / Del
+        if (s_cursor_pos > 0) {
+            s_cursor_pos--;
+            s_line_len--;
+            // Shift characters left
+            memmove(s_line + s_cursor_pos, s_line + s_cursor_pos + 1, s_line_len - s_cursor_pos + 1);
+
+            // Echo: backspace, reprint rest of line, clear extra char, move cursor back
+            echo_backspace();
+            tx_raw(s_line + s_cursor_pos, s_line_len - s_cursor_pos);
+            tx_raw(" ", 1);
+            for (int i = 0; i <= s_line_len - s_cursor_pos; i++) echo_backspace();
+        }
+        return 0;
+    }
+
     if (c == '\r' || c == '\n') {
-        /* Collapse CRLF / LFCR sequences -> only one line event */
         if (s_last_was_eol && (s_last_was_eol != (uint8_t)c)) {
             s_last_was_eol = 0;
-            return (int)b;
+            return 0;
         }
         s_last_was_eol = (uint8_t)c;
 
         tx_raw("\r\n", 2);
         if (s_ready) {
-            /* Consumer hasn't picked up last line yet -> drop this one */
             s_line_len = 0;
+            s_cursor_pos = 0;
             s_line[0]  = 0;
             tx_str("cli: input overflow, line dropped\r\n");
             return -1;
         }
-        /* Publish ready line */
+
+        // Save to history before publishing
+        cli_history_add(s_line);
+
         memcpy(s_ready_line, s_line, s_line_len + 1);
         s_ready     = 1;
         s_line_len  = 0;
+        s_cursor_pos = 0;
         s_line[0]   = 0;
-        return (int)b;
+        return 0;
     } else {
         s_last_was_eol = 0;
     }
 
-    /* Ignore other non-printable (except 0x09 tab, we expand to spaces) */
-    if (c == '\t') {
-        /* Insert spaces for tab, stay within budget */
-        static const char s_spc[] = "    ";
-        uint8_t need = sizeof(s_spc) - 1;
-        if (s_line_len + need >= CLI_LINE_MAX - 1) {
-            tx_raw("\a", 1);                        /* BEL */
-            return -1;
-        }
-        memcpy(&s_line[s_line_len], s_spc, need);
-        s_line_len += need;
-        s_line[s_line_len] = 0;
-        tx_raw(s_spc, need);
-        return (int)b;
-    }
-
     if (c < 0x20) {
-        return (int)b;                              /* swallow silently */
+        return 0;
     }
 
-    /* Ordinary printable character */
-    if (s_line_len + 1 >= CLI_LINE_MAX - 1) {
-        tx_raw("\a", 1);                            /* BEL: input too long */
+    if (s_line_len >= CLI_LINE_MAX - 1) {
+        tx_raw("\a", 1);
         return -1;
     }
-    s_line[s_line_len++] = c;
-    s_line[s_line_len]   = 0;
-    cli_uart_putc((uint8_t)c);                      /* echo */
-    return (int)b;
+
+    // Insert character at cursor position
+    if (s_cursor_pos < s_line_len) {
+        memmove(s_line + s_cursor_pos + 1, s_line + s_cursor_pos, s_line_len - s_cursor_pos + 1);
+    }
+    s_line[s_cursor_pos] = c;
+    s_cursor_pos++;
+    s_line_len++;
+
+    // Echo the inserted character and the rest of the line
+    tx_raw(&s_line[s_cursor_pos - 1], s_line_len - s_cursor_pos + 1);
+
+    // Move cursor back to the correct position
+    for (int i = 0; i < s_line_len - s_cursor_pos; i++) {
+        tx_raw("\b", 1);
+    }
+
+    return 0;
 }
 
 /* --------------------------- tokenizer ----------------------------------- */
@@ -188,11 +368,9 @@ static int split_args(char *line, char *argv[], int argv_max)
     int argc = 0;
     char *p = line;
     while (*p && argc < argv_max) {
-        /* skip leading blanks */
         while (*p && (*p == ' ' || *p == '\t')) p++;
         if (!*p) break;
         argv[argc++] = p;
-        /* skip until next blank */
         while (*p && *p != ' ' && *p != '\t') p++;
         if (*p) *p++ = 0;
     }
@@ -205,7 +383,7 @@ static int find_and_run(char *line)
 {
     static char *argv[CLI_ARGV_MAX];
     int argc = split_args(line, argv, CLI_ARGV_MAX);
-    if (argc == 0) return 0;                        /* empty line, ok */
+    if (argc == 0) return 0;
 
     const char *name = argv[0];
     for (uint8_t i = 0; i < s_cmd_count; i++) {
@@ -219,7 +397,6 @@ static int find_and_run(char *line)
             return 1;
         }
     }
-    /* Not found */
     tx_str("  Unknown command: ");
     tx_str(name);
     tx_str(". Type 'help' to list all.\r\n");
@@ -232,14 +409,13 @@ int cli_task(void)
 {
     int executed = 0;
     if (s_ready) {
-        /* Copy line out then immediately release producer slot */
         char line[CLI_LINE_MAX];
         // __disable_irq();
         memcpy(line, s_ready_line, sizeof(line));
         s_ready = 0;
         // __enable_irq();
 
-        if (line[0]) {                               /* skip empty */
+        if (line[0]) {
             find_and_run(line);
             executed++;
         }
