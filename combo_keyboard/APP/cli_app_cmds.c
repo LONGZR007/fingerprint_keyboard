@@ -73,21 +73,6 @@ void cli_uart_set_baud(uint32_t baud)
  * Commands
  * ===================================================================== */
 
-static const cli_cmd_t s_app_cmds[];   /* forward for help listing */
-
-/* --- help --------------------------------------------------------------- */
-static int cmd_help(int argc, char *argv[])
-{
-    (void)argc; (void)argv;
-    cli_print("\r\n  Available commands:\r\n");
-    for (const cli_cmd_t *c = s_app_cmds; c->name; c++) {
-        cli_print("    %-12s %s\r\n", c->name, c->help ? c->help : "");
-    }
-    cli_print("\r\n  Usage: <command> [arg1] [arg2]...  (blank-separated, "
-              "max %d args)\r\n", CLI_ARGV_MAX - 1);
-    return 0;
-}
-
 /* --- echo --------------------------------------------------------------- */
 static int cmd_echo(int argc, char *argv[])
 {
@@ -281,23 +266,18 @@ static int cmd_channel(int argc, char *argv[])
 }
 
 /* =======================================================================
- * Command table + registration entry
+ * Static command registration via linker section ("cli_cmds").
+ * No runtime registration call needed: cli core discovers these through
+ * __start_cli_cmds / __stop_cli_cmds at lookup time. The built-in 'help'
+ * (registered dynamically in cli_init) lists these too.
  * ===================================================================== */
 
-static const cli_cmd_t s_app_cmds[] = {
-    { "help",   cmd_help,   "list all commands" },
-    { "echo",   cmd_echo,   "echo <words...>          print arguments" },
-    { "type",   cmd_type,   "type <words...>          HID-type string (letters/digits/symbols)" },
-    { "channel", cmd_channel, "channel [ble|usb|both]   set HID output channel" },
-    { "info",   cmd_info,   "show build / hw / BLE info" },
-    { "reset",  cmd_reset,  "software reset MCU" },
-    { "adv",    cmd_adv,    "adv [on|off]             control BLE advertising" },
-    { "led",    cmd_led,    "led [on|off]             toggle PA13 LED" },
-    { "baud",   cmd_baud,   "baud <rate>              change CLI UART baudrate" },
-    { NULL,     NULL,       NULL }
-};
+CLI_CMD_REGISTER("echo",    cmd_echo,    "echo <words...>          print arguments");
+CLI_CMD_REGISTER("type",    cmd_type,    "type <words...>          HID-type string (letters/digits/symbols)");
+CLI_CMD_REGISTER("channel", cmd_channel, "channel [ble|usb|both]   set HID output channel");
+CLI_CMD_REGISTER("info",    cmd_info,    "show build / hw / BLE info");
+CLI_CMD_REGISTER("reset",   cmd_reset,   "software reset MCU");
+CLI_CMD_REGISTER("adv",     cmd_adv,     "adv [on|off]             control BLE advertising");
+CLI_CMD_REGISTER("led",     cmd_led,     "led [on|off]             toggle PA13 LED");
+CLI_CMD_REGISTER("baud",    cmd_baud,    "baud <rate>              change CLI UART baudrate");
 
-int cli_app_cmds_register(void)
-{
-    return cli_register_cmds(s_app_cmds);
-}

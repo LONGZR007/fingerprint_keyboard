@@ -163,14 +163,8 @@ static int cmd_user(int argc, char *argv[])
 }
 
 /* =======================================================================
- * 命令表 + 初始化入口
+ * 静态命令注册 (链接器 "cli_cmds" 段), 无需运行时初始化
  * ===================================================================== */
-static const cli_cmd_t s_user_cmds[] = {
-    { "user", cmd_user, "User data flash storage: set/get/del/clear/list/count" },
-    { NULL,  NULL,      NULL }
-};
 
-void user_flash_cli_init(void)
-{
-    cli_register_cmds(s_user_cmds);
-}
+CLI_CMD_REGISTER("user", cmd_user, "User data flash storage: set/get/del/clear/list/count");
+

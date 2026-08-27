@@ -186,18 +186,15 @@ static int cmd_fp(int argc, char *argv[])
 }
 
 /* =======================================================================
- * 命令表 + 初始化入口
+ * 静态命令注册 (链接器 "cli_cmds" 段) + 初始化入口
+ * fp 命令无需运行时注册, 由 cli core 通过段符号自动发现
  * ===================================================================== */
 
-static const cli_cmd_t s_fp_cmds[] = {
-    { "fp", cmd_fp, "Fingerprint control: enroll/verify/delete/clear/status/cancel" },
-    { NULL, NULL, NULL }
-};
+CLI_CMD_REGISTER("fp", cmd_fp, "Fingerprint control: enroll/verify/delete/clear/status/cancel");
 
 void fp_app_cmds_init(void)
 {
-    /* 注册指纹通知回调 */
+    /* 仅注册指纹通知回调 (fp 命令本身已由链接器段静态注册) */
     fp_sm_set_notify_cb(fp_msg_handler);
-    /* 注册 fp 命令到 CLI 命令表 */
-    cli_register_cmds(s_fp_cmds);
 }
+

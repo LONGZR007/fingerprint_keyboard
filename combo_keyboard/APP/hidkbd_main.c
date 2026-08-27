@@ -39,7 +39,6 @@ const uint8_t MacAddr[6] = {0x84, 0xC2, 0xE4, 0x03, 0x02, 0x02};
 #define CLI_TASK_EVT_POLL     0x0001
 #define CLI_POLL_MS           5
 static uint8_t cli_task_id = INVALID_TASK_ID;
-extern int   cli_app_cmds_register(void);
 
 static uint16_t CliTask_ProcessEvent(uint8_t task_id, uint16_t events)
 {
@@ -59,7 +58,6 @@ static void Cli_Init(void)
 {
     cli_uart_init();
     cli_init();
-    cli_app_cmds_register();
     cli_task_id = TMOS_ProcessEventRegister(CliTask_ProcessEvent);
     cli_print("\r\n=== CLI ready on UART%d %u 8N1 ===\r\n",
               (int)1 /* CLI_UART_PORT */, (unsigned)CLI_UART_BAUD);
@@ -76,7 +74,6 @@ static void Cli_Init(void)
 #define FP_POLL_MS           5
 static uint8_t fp_task_id = INVALID_TASK_ID;
 extern void fp_app_cmds_init(void);  /* 定义在 fp_app_cmds.c */
-extern void user_flash_cli_init(void);  /* 定义在 user_flash_cli.c */
 
 static uint16_t FpTask_ProcessEvent(uint8_t task_id, uint16_t events)
 {
@@ -153,8 +150,7 @@ int main(void)
     HidEmu_Init();
     Cli_Init();
     Fp_Init();               /* 指纹模组驱动初始化 */
-    user_flash_init();       /* 用户数据存储模块初始化 */
-    user_flash_cli_init();  /* 注册 user CLI 命令 */
+    user_flash_init();       /* 用户数据存储模块初始化 (user 命令已由链接器段静态注册) */
     /* USB composite device (HID keyboard + CDC serial) */
     usb_composite_init();
     cli_print("USB composite device initialized.\r\n");

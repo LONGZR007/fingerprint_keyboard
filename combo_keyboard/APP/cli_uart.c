@@ -249,3 +249,14 @@ void cli_uart_putc(uint8_t b)
         U_SendByte('\r');
     }
 }
+
+/* CLI core TX entry: send a raw buffer via the same UART.
+ * This strong definition overrides the weak default in cli.c (which would
+ * otherwise use putchar/fflush — unavailable on bare metal). */
+void cli_tx_raw(const char *data, uint16_t len)
+{
+    if (!s_ready) return;
+    while (len--) {
+        cli_uart_putc((uint8_t)*data++);
+    }
+}
