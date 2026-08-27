@@ -12,8 +12,19 @@
  *******************************************************************************/
 
 #include "CH58x_common.h"
+#include "CH58xBLE_LIB.h"      /* TMOS_GetSystemClock() ms counter */
 #include "usb_composite.h"
+#include "cli.h"
+#include "cli_uart.h"          /* cli_uart_putc(): UART1-only debug out */
 #include <string.h>
+
+/* USB enumeration debug log via UART1 (CLI channel).  Define to 0 to disable. */
+#define USB_DEBUG_LOG 1
+#if USB_DEBUG_LOG
+#define USB_LOG(...)  cli_print(__VA_ARGS__)
+#else
+#define USB_LOG(...)  ((void)0)
+#endif
 
 /*********************************************************************
  * DMA buffers (4-byte aligned)
@@ -29,9 +40,9 @@ __attribute__((aligned(4))) static uint8_t EP3_Databuf[64 + 64];
 
 #define Ep0Buffer    (&EP0_Databuf[0])      /* EP0 setup/data          */
 #define Ep4OutBuffer (&EP0_Databuf[64])     /* EP4 OUT data (CDC RX)  */
-#define Ep1InBuffer  (&EP1_Databuf[64])     /* EP1 IN  (HID reports)  */
-#define Ep2InBuffer  (&EP2_Databuf[64])     /* EP2 IN  (CDC notify)   */
-#define Ep3InBuffer  (&EP3_Databuf[64])     /* EP3 IN  (CDC TX)       */
+#define Ep1InBuffer  (&EP1_Databuf[0])      /* EP1 IN  (HID reports)  */
+#define Ep2InBuffer  (&EP2_Databuf[0])      /* EP2 IN  (CDC notify)   */
+#define Ep3InBuffer  (&EP3_Databuf[0])      /* EP3 IN  (CDC TX)       */
 
 /*********************************************************************
  * Types
@@ -116,6 +127,7 @@ static const uint8_t *const StringDesc[] = { LangDesc, ManuDesc, ProdDesc, Seria
 static volatile uint8_t  usb_setup_flag;          /* SETUP received, needs task processing */
 static volatile uint8_t  usb_dev_config;          /* non-zero once SET_CONFIGURATION done   */
 static volatile uint8_t  usb_suspended;
+static volatile uint8_t  usb_bus_reset_pending;   /* printed by task for diagnostics       */
 
 static volatile uint8_t  ep1_in_ready;            /* EP1 IN (HID) transfer complete          */
 static volatile uint8_t  ep3_in_ready;            /* EP3 IN (CDC TX) transfer complete       */
@@ -133,9 +145,44 @@ static const uint8_t *ep0_in_ptr;
 static uint16_t       ep0_in_remaining;
 static uint8_t        ep0_in_zlp;
 
-#define CDC_RX_SIZE 64
-static uint8_t         cdc_rx_buf[CDC_RX_SIZE];
-static volatile uint16_t cdc_rx_len;
+#define CDC_RX_RING_SIZE 256
+static uint8_t         cdc_rx_ring[CDC_RX_RING_SIZE];
+static volatile uint16_t cdc_rx_head;      /* written by EP4 IRQ path    */
+static volatile uint16_t cdc_rx_tail;      /* consumed by usb_cdc_recv() */
+
+/* ---- CDC TX: non-blocking ring, flushed from usb_composite_task() ----
+ * usb_cdc_send() only enqueues (never blocks), so the CLI can mirror its
+ * output to the USB CDC port without stalling on EP3 flow. */
+#define CDC_TX_RING_SIZE 1024
+static uint8_t          cdc_tx_ring[CDC_TX_RING_SIZE];
+static volatile uint16_t cdc_tx_head;
+static volatile uint16_t cdc_tx_tail;
+
+static void cdc_tx_pump(void)
+{
+    uint16_t tail = cdc_tx_tail;
+    uint16_t head = cdc_tx_head;
+    uint16_t n = 0;
+
+    if (tail == head) return;                 /* nothing queued        */
+    if (!ep3_in_ready) return;                /* previous frame in air */
+    while (n < 64 && tail != head) {
+        Ep3InBuffer[n++] = cdc_tx_ring[tail];
+        if (++tail >= CDC_TX_RING_SIZE) tail = 0;
+    }
+    cdc_tx_tail = tail;
+    ep3_in_ready = 0;
+    R8_UEP3_T_LEN = (uint8_t)n;
+    R8_UEP3_CTRL = (R8_UEP3_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_ACK;
+    /* DEBUG [CDC TX]: print every frame sent out EP3 to UART1 ONLY
+     * (never routed to CDC, no recursion). Format: [u<len hex>] */
+    {
+        static const char hexc[] = "0123456789ABCDEF";
+        cli_uart_putc('['); cli_uart_putc('u');
+        cli_uart_putc(hexc[(n >> 4) & 0x0F]); cli_uart_putc(hexc[n & 0x0F]);
+        cli_uart_putc(']');
+    }
+}
 
 /* ---- Async USB HID string-type state machine ----
  *
@@ -150,7 +197,7 @@ static volatile uint16_t cdc_rx_len;
 #define USB_STEP_RELEASE   2
 #define USB_STEP_WAIT_REL  3
 #define USB_STEP_NEXT      4
-#define USB_STEP_DELAY_US  1200UL
+#define USB_STEP_DELAY_MS  25UL   /* press/release hold time, ms */
 
 static char     s_ut_buf[USB_TYPE_BUF_SIZE];
 static uint16_t s_ut_len    = 0;
@@ -161,23 +208,28 @@ static uint8_t  s_ut_kc     = 0;
 static uint8_t  s_ut_supp   = 0;
 static volatile uint8_t s_ut_busy = 0;
 static int       s_ut_typed = 0;
-static uint32_t  s_ut_deadline = 0;   /* microsecond deadline via GetSysClock */
+static uint32_t  s_ut_deadline = 0;   /* ms deadline via TMOS_GetSystemClock */
 
 static int usb_ascii_to_hid(char ch, uint8_t *modifier, uint8_t *keycode);
 
 /*********************************************************************
  * Deferred IRQ event ring buffer (single producer: IRQ, single consumer: task)
  *********************************************************************/
-#define IRQ_RING_SIZE 8
+#define IRQ_RING_SIZE 32
 typedef struct {
     uint8_t token;   /* UIS_TOKEN_IN / UIS_TOKEN_OUT */
     uint8_t ep;      /* endpoint index (0..4)         */
     uint8_t len;     /* R8_USB_RX_LEN for OUT         */
+    uint8_t tog_ok;  /* RB_UIS_TOG_OK at transfer time */
 } irq_evt_t;
 
 static volatile irq_evt_t irq_ring[IRQ_RING_SIZE];
 static volatile uint8_t   irq_head;
 static volatile uint8_t   irq_tail;
+static volatile uint16_t  usb_evt_dropped;   /* ring overflow counter  */
+static volatile uint32_t  usb_transfer_irq_cnt; /* total TRANSFER irq  */
+static volatile uint32_t  usb_setup_irq_cnt;     /* SETUP_ACT irq count */
+static volatile uint32_t  usb_ep1in_irq, usb_ep3in_irq, usb_ep4out_irq;
 
 static uint8_t irq_ring_pop(irq_evt_t *e)
 {
@@ -186,9 +238,10 @@ static uint8_t irq_ring_pop(irq_evt_t *e)
     if (h == t) {
         return 0;
     }
-    e->token = irq_ring[t].token;
-    e->ep    = irq_ring[t].ep;
-    e->len   = irq_ring[t].len;
+    e->token  = irq_ring[t].token;
+    e->ep     = irq_ring[t].ep;
+    e->len    = irq_ring[t].len;
+    e->tog_ok = irq_ring[t].tog_ok;
     t++;
     if (t >= IRQ_RING_SIZE) t = 0;
     irq_tail = t;
@@ -200,8 +253,17 @@ static uint8_t irq_ring_pop(irq_evt_t *e)
  *********************************************************************/
 
 /* Send the next chunk (<=64B) of a control-IN data phase, or the status ZLP,
- * or restore EP0 to idle when the transfer is finished. */
-static void ep0_send_chunk(void)
+ * or restore EP0 to idle when the transfer is finished.
+ *
+ * EP0 data toggle is NOT handled by hardware on CH58x (no RB_UEP_AUTO_TOG for
+ * EP0), so the firmware must set the PID toggle itself.  After a SETUP token
+ * the hardware resets the toggle to DATA0; the first data packet must then be
+ * DATA1, and every later packet alternates (see the WCH CH583 examples:
+ * "默认数据包是DATA1").
+ *
+ *  first - 1: first packet after SETUP (force DATA1)
+ *          0: continuation packet (flip the DATA toggle first) */
+static void ep0_send_chunk(uint8_t first)
 {
     uint16_t n;
 
@@ -213,20 +275,34 @@ static void ep0_send_chunk(void)
         ep0_in_ptr     += n;
         ep0_in_remaining = (uint16_t)(ep0_in_remaining - n);
         R8_UEP0_T_LEN  = (uint8_t)n;
-        R8_UEP0_CTRL   = UEP_R_RES_ACK | UEP_T_RES_ACK;
+        if (first) {
+            R8_UEP0_CTRL = RB_UEP_R_TOG | RB_UEP_T_TOG | UEP_R_RES_ACK | UEP_T_RES_ACK;
+        } else {
+            R8_UEP0_CTRL ^= RB_UEP_T_TOG;
+            R8_UEP0_CTRL = (R8_UEP0_CTRL & ~(MASK_UEP_R_RES | MASK_UEP_T_RES))
+                           | UEP_R_RES_ACK | UEP_T_RES_ACK;
+        }
         return;
     }
 
     if (ep0_in_zlp) {
         ep0_in_zlp   = 0;
         R8_UEP0_T_LEN = 0;
-        R8_UEP0_CTRL  = UEP_R_RES_ACK | UEP_T_RES_ACK;
+        if (first) {
+            R8_UEP0_CTRL = RB_UEP_R_TOG | RB_UEP_T_TOG | UEP_R_RES_ACK | UEP_T_RES_ACK;
+        } else {
+            R8_UEP0_CTRL ^= RB_UEP_T_TOG;
+            R8_UEP0_CTRL = (R8_UEP0_CTRL & ~(MASK_UEP_R_RES | MASK_UEP_T_RES))
+                           | UEP_R_RES_ACK | UEP_T_RES_ACK;
+        }
         return;
     }
 
-    /* transfer finished: return EP0 to idle (accept SETUP/OUT, NAK IN) */
+    /* transfer finished: idle, wait for the next SETUP (like WCH's default
+     * branch).  Keep the DATA1 toggle flags so the following status-stage
+     * OUT of a control read still matches. */
     R8_UEP0_T_LEN = 0;
-    R8_UEP0_CTRL  = UEP_R_RES_ACK | UEP_T_RES_NAK;
+    R8_UEP0_CTRL  = RB_UEP_R_TOG | RB_UEP_T_TOG | UEP_R_RES_NAK | UEP_T_RES_NAK;
 }
 
 /* Start a control-IN data phase from a descriptor/buffer.
@@ -242,7 +318,7 @@ static void ep0_start_in(const uint8_t *data, uint16_t len, uint16_t wLength)
     /* ZLP needed only when we send a multiple of EP0 max packet (64)
      * but less than the host requested (short packet would otherwise be missing) */
     ep0_in_zlp = (n < wLength && (n % 64) == 0 && n != 0) ? 1 : 0;
-    ep0_send_chunk();
+    ep0_send_chunk(1);   /* first packet after SETUP must be DATA1 */
 }
 
 /* Send a zero-length status packet (control-write status phase) */
@@ -251,7 +327,8 @@ static void ep0_send_zlp(void)
     ep0_in_remaining = 0;
     ep0_in_zlp       = 0;
     R8_UEP0_T_LEN    = 0;
-    R8_UEP0_CTRL     = UEP_R_RES_ACK | UEP_T_RES_ACK;
+    /* status phase packet is DATA1 as well */
+    R8_UEP0_CTRL     = RB_UEP_R_TOG | RB_UEP_T_TOG | UEP_R_RES_ACK | UEP_T_RES_ACK;
 }
 
 /* Stall EP0 (unsupported request) */
@@ -259,7 +336,7 @@ static void ep0_stall(void)
 {
     ep0_in_remaining = 0;
     ep0_in_zlp       = 0;
-    R8_UEP0_CTRL     = UEP_R_RES_ACK | UEP_T_RES_STALL;
+    R8_UEP0_CTRL     = RB_UEP_R_TOG | RB_UEP_T_TOG | UEP_R_RES_STALL | UEP_T_RES_STALL;
 }
 
 /*********************************************************************
@@ -267,7 +344,12 @@ static void ep0_stall(void)
  *********************************************************************/
 static void usb_process_setup(void)
 {
-    usb_setup_req_t *req = (usb_setup_req_t *)Ep0Buffer;
+    /* Copy the SETUP packet out of Ep0Buffer first: the data phase of the
+     * control transfer reuses the same DMA buffer, and the hardware writes a
+     * new SETUP packet into Ep0Buffer as soon as it is accepted. */
+    uint8_t setup_buf[8];
+    memcpy(setup_buf, Ep0Buffer, 8);
+    usb_setup_req_t *req = (usb_setup_req_t *)setup_buf;
     uint8_t  reqType = req->bmRequestType;
     uint8_t  reqCode = req->bRequest;
     uint16_t wValue  = req->wValue;
@@ -280,6 +362,10 @@ static void usb_process_setup(void)
     ep0_in_remaining   = 0;
     ep0_in_zlp         = 0;
     ep0_out_expect_line = 0;
+
+    USB_LOG("[USB] S t=%02X r=%02X v=%04X i=%04X l=%u\r\n",
+            (unsigned)reqType, (unsigned)reqCode, (unsigned)wValue,
+            (unsigned)wIndex, (unsigned)wLength);
 
     if ((reqType & USB_REQ_TYP_MASK) == USB_REQ_TYP_STANDARD) {
         switch (reqCode) {
@@ -352,7 +438,8 @@ static void usb_process_setup(void)
         case 0x20:  /* SET_LINE_CODING: accept OUT data phase first */
             ep0_out_expect_line = 1;
             R8_UEP0_T_LEN = 0;
-            R8_UEP0_CTRL  = UEP_R_RES_ACK | UEP_T_RES_NAK;
+            /* OUT data phase after SETUP is DATA1 */
+            R8_UEP0_CTRL  = RB_UEP_R_TOG | RB_UEP_T_TOG | UEP_R_RES_ACK | UEP_T_RES_NAK;
             break;
 
         case 0x21: {  /* GET_LINE_CODING: return 7-byte struct */
@@ -396,14 +483,17 @@ static void usb_reset_endpoints(void)
     R8_USB_DEV_AD = 0x00;
 
     usb_dev_config      = 0;
-    ep1_in_ready        = 0;
-    ep3_in_ready        = 0;
+    ep1_in_ready        = 1;   /* idle: no transfer in flight */
+    ep3_in_ready        = 1;   /* idle: no transfer in flight */
     addr_pending        = 0;
     ep0_out_expect_line = 0;
     ep0_in_remaining    = 0;
     ep0_in_zlp          = 0;
-    cdc_rx_len          = 0;
+    cdc_rx_head         = 0;
+    cdc_rx_tail         = 0;
     cdc_line_state      = 0;
+    cdc_tx_head         = 0;
+    cdc_tx_tail         = 0;
 }
 
 /*********************************************************************
@@ -419,25 +509,33 @@ void USB_IRQHandler(void)
     uint8_t len;
 
     if (R8_USB_INT_FG & RB_UIF_TRANSFER) {
+        usb_transfer_irq_cnt++;
         int_st = R8_USB_INT_ST;
         if (int_st & RB_UIS_SETUP_ACT) {
             /* SETUP token received - defer processing to task().
              * NAK further OUT/IN so the 8-byte setup packet in Ep0Buffer
              * is not overwritten before the task reads it. */
+            usb_setup_irq_cnt++;
             usb_setup_flag = 1;
             R8_UEP0_CTRL = UEP_R_RES_NAK | UEP_T_RES_NAK;
         } else {
             token = int_st & MASK_UIS_TOKEN;
             ep    = int_st & MASK_UIS_ENDP;
             len   = R8_USB_RX_LEN;
+            if (ep == 1 && token == UIS_TOKEN_IN)  usb_ep1in_irq++;
+            else if (ep == 3 && token == UIS_TOKEN_IN)  usb_ep3in_irq++;
+            else if (ep == 4 && token == UIS_TOKEN_OUT) usb_ep4out_irq++;
             /* push to ring buffer (drop if full) */
             uint8_t next = (uint8_t)(irq_head + 1);
             if (next >= IRQ_RING_SIZE) next = 0;
             if (next != irq_tail) {
-                irq_ring[irq_head].token = token;
-                irq_ring[irq_head].ep    = ep;
-                irq_ring[irq_head].len   = len;
+                irq_ring[irq_head].token  = token;
+                irq_ring[irq_head].ep     = ep;
+                irq_ring[irq_head].len    = len;
+                irq_ring[irq_head].tog_ok = (int_st & RB_UIS_TOG_OK) ? 1 : 0;
                 irq_head = next;
+            } else {
+                usb_evt_dropped++;
             }
         }
         R8_USB_INT_FG = RB_UIF_TRANSFER;
@@ -445,6 +543,7 @@ void USB_IRQHandler(void)
 
     if (R8_USB_INT_FG & RB_UIF_BUS_RST) {
         usb_reset_endpoints();
+        usb_bus_reset_pending = 1;
         R8_USB_INT_FG = RB_UIF_BUS_RST;
     }
 
@@ -464,13 +563,14 @@ void usb_composite_init(void)
     usb_setup_flag      = 0;
     usb_dev_config      = 0;
     usb_suspended      = 0;
-    ep1_in_ready        = 0;
-    ep3_in_ready        = 0;
+    ep1_in_ready        = 1;   /* idle: no transfer in flight */
+    ep3_in_ready        = 1;   /* idle: no transfer in flight */
     addr_pending        = 0;
     ep0_out_expect_line = 0;
     ep0_in_remaining    = 0;
     ep0_in_zlp          = 0;
-    cdc_rx_len          = 0;
+    cdc_rx_head         = 0;
+    cdc_rx_tail         = 0;
     cdc_line_state      = 0;
     irq_head            = 0;
     irq_tail            = 0;
@@ -488,7 +588,8 @@ void usb_composite_init(void)
     R8_UEP4_1_MOD = RB_UEP1_TX_EN | RB_UEP4_RX_EN;
     R8_UEP2_3_MOD = RB_UEP2_TX_EN | RB_UEP3_TX_EN;
 
-    /* DMA buffer addresses (EP4 shares the EP0 DMA area) */
+    /* DMA buffer addresses (EP4's buffer is hardware-fixed at UEP0_DMA+64;
+     * EP4 RX lands in Ep4OutBuffer automatically) */
     R16_UEP0_DMA = (uint16_t)(uint32_t)EP0_Databuf;
     R16_UEP1_DMA = (uint16_t)(uint32_t)EP1_Databuf;
     R16_UEP2_DMA = (uint16_t)(uint32_t)EP2_Databuf;
@@ -505,23 +606,30 @@ void usb_composite_init(void)
     R8_USB_CTRL = RB_UC_DEV_PU_EN | RB_UC_INT_BUSY | RB_UC_DMA_EN;
     R16_PIN_ANALOG_IE |= RB_PIN_USB_IE | RB_PIN_USB_DP_PU;
     R8_USB_INT_FG = 0xFF;
-    R8_UDEV_CTRL = RB_UD_PD_DIS | RB_UD_PORT_EN;
+    R8_UDEV_CTRL = RB_UD_PD_DIS;   /* disable pulldowns first... */
     R8_USB_INT_EN = RB_UIE_SUSPEND | RB_UIE_BUS_RST | RB_UIE_TRANSFER;
 
     PFIC_EnableIRQ(USB_IRQn);
+    R8_UDEV_CTRL |= RB_UD_PORT_EN; /* ...enable the physical port last (WCH order) */
 }
 
 void usb_composite_task(void)
 {
     irq_evt_t evt;
 
-    /* process a pending SETUP request */
-    if (usb_setup_flag) {
-        usb_setup_flag = 0;
-        usb_process_setup();
+    /* 1) 先按 FIFO 消化所有 deferred 端点事件，再处理新 SETUP。
+     *    !!! 顺序至关重要 !!! 主机的控制传输 token 以微秒级连续到达
+     *    （数据阶段 IN/OUT、状态阶段 OUT、下一个 SETUP）。若先处理 SETUP
+     *    再处理 ring 里的旧事件，旧 IN/OUT 事件会把新 SETUP 刚配置的 EP0
+     *    应答覆盖回 NAK/错误 toggle，导致主机状态阶段超时（error -110）。 */
+    if (usb_bus_reset_pending) {
+        usb_bus_reset_pending = 0;
+        USB_LOG("[USB] BR t=%lu s=%lu drop=%u\r\n",
+                (unsigned long)usb_transfer_irq_cnt,
+                (unsigned long)usb_setup_irq_cnt,
+                (unsigned)usb_evt_dropped);
     }
 
-    /* process deferred endpoint events */
     while (irq_ring_pop(&evt)) {
         switch (evt.ep) {
         case 0:
@@ -531,10 +639,25 @@ void usb_composite_task(void)
                     R8_USB_DEV_AD = pending_addr;
                     addr_pending = 0;
                 }
-                ep0_send_chunk();
-            } else if (evt.token == UIS_TOKEN_OUT) {
+                if (ep0_in_remaining > 0 || ep0_in_zlp) {
+                    /* continuation packet: flip the DATA toggle and send */
+                    ep0_send_chunk(0);
+                    USB_LOG("[USB] I0 rem=%u\r\n", (unsigned)ep0_in_remaining);
+                } else {
+                    /* data phase finished: keep the DATA1 toggle flag and arm
+                     * for the status-stage OUT (which is DATA1).  Writing a
+                     * plain UEP_R_RES_ACK|UEP_T_RES_NAK here would clear
+                     * RB_UEP_R_TOG back to DATA0 and the status-stage OUT
+                     * would then fail the toggle check -> enumeration hangs.
+                     * (See WCH CH583 examples: "默认数据包是DATA1") */
+                    R8_UEP0_T_LEN = 0;
+                    R8_UEP0_CTRL  = RB_UEP_R_TOG | RB_UEP_T_TOG
+                                    | UEP_R_RES_ACK | UEP_T_RES_NAK;
+                    USB_LOG("[USB] I0 done\r\n");
+                }
+            } else if (evt.token == UIS_TOKEN_OUT && evt.tog_ok) {
                 if (ep0_out_expect_line) {
-                    /* SET_LINE_CODING data phase */
+                    /* SET_LINE_CODING data phase (DATA1) */
                     uint8_t *p = Ep0Buffer;
                     ep0_out_expect_line = 0;
                     line_coding.baud_rate = (uint32_t)p[0]
@@ -544,13 +667,18 @@ void usb_composite_task(void)
                     line_coding.stop_bits = p[4];
                     line_coding.parity    = p[5];
                     line_coding.data_bits = p[6];
-                    /* status ZLP */
+                    /* status ZLP (DATA1) */
                     R8_UEP0_T_LEN = 0;
-                    R8_UEP0_CTRL  = UEP_R_RES_NAK | UEP_T_RES_ACK;
+                    R8_UEP0_CTRL  = RB_UEP_R_TOG | RB_UEP_T_TOG
+                                    | UEP_R_RES_NAK | UEP_T_RES_ACK;
+                    USB_LOG("[USB] O0 line\r\n");
                 } else {
-                    /* status OUT of a control read: back to idle */
+                    /* status-stage OUT of a control read: transfer done.
+                     * Go idle (NAK) and wait for the next SETUP. */
                     R8_UEP0_T_LEN = 0;
-                    R8_UEP0_CTRL  = UEP_R_RES_ACK | UEP_T_RES_NAK;
+                    R8_UEP0_CTRL  = RB_UEP_R_TOG | RB_UEP_T_TOG
+                                    | UEP_R_RES_NAK | UEP_T_RES_NAK;
+                    USB_LOG("[USB] O0 done\r\n");
                 }
             }
             break;
@@ -570,16 +698,24 @@ void usb_composite_task(void)
             break;
 
         case 4:
-            if (evt.token == UIS_TOKEN_OUT) {
-                /* CDC data received on EP4 OUT */
+            if (evt.token == UIS_TOKEN_OUT && evt.tog_ok) {
+                /* CDC data received on EP4 OUT -> RX ring */
                 uint8_t n = evt.len;
-                if (n > CDC_RX_SIZE) n = CDC_RX_SIZE;
+                uint16_t head = cdc_rx_head;
                 for (uint8_t i = 0; i < n; i++) {
-                    cdc_rx_buf[i] = Ep4OutBuffer[i];
+                    uint16_t next = (uint16_t)(head + 1);
+                    if (next >= CDC_RX_RING_SIZE) next = 0;
+                    if (next == cdc_rx_tail) break;   /* ring full: drop rest */
+                    cdc_rx_ring[head] = Ep4OutBuffer[i];
+                    head = next;
                 }
-                cdc_rx_len = n;
-                /* re-arm EP4 OUT */
+                cdc_rx_head = head;
+                /* re-arm EP4 OUT. EP4 has NO AUTO_TOG (like EP0), so the
+                 * expected RX toggle must be flipped by software after every
+                 * accepted packet, otherwise the host's next DATA1 packet is
+                 * rejected as a toggle error. */
                 R8_UEP4_CTRL = (R8_UEP4_CTRL & ~MASK_UEP_R_RES) | UEP_R_RES_ACK;
+                R8_UEP4_CTRL ^= RB_UEP_R_TOG;
             }
             break;
 
@@ -588,9 +724,18 @@ void usb_composite_task(void)
         }
     }
 
+    /* 2) 再处理 pending SETUP（必须在 ring 全部消化之后，见上方注释） */
+    if (usb_setup_flag) {
+        usb_setup_flag = 0;
+        usb_process_setup();
+    }
+
+    /* 3) flush queued CDC TX data (non-blocking) */
+    cdc_tx_pump();
+
     /* ---- Async USB HID type state machine: 每次调用最多推一步 ---- */
     if (s_ut_busy) {
-        uint32_t now = GetSysClock() / 1000UL;  /* us  */
+        uint32_t now = TMOS_GetSystemClock();   /* ms counter (BLE lib) */
         switch (s_ut_step) {
             case USB_STEP_PRESS: {
                 char ch = s_ut_buf[s_ut_idx];
@@ -605,7 +750,7 @@ void usb_composite_task(void)
                     R8_UEP1_T_LEN = 8;
                     R8_UEP1_CTRL = (R8_UEP1_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_ACK;
                     s_ut_step = USB_STEP_WAIT_PRESS;
-                    s_ut_deadline = now + USB_STEP_DELAY_US;
+                    s_ut_deadline = now + USB_STEP_DELAY_MS;
                 } else {
                     s_ut_supp = 0;
                     s_ut_step = USB_STEP_NEXT;   /* skip unsupported char */
@@ -613,9 +758,9 @@ void usb_composite_task(void)
                 break;
             }
             case USB_STEP_WAIT_PRESS:
-                /* wait for IN-complete OR timeout to make sure host has
-                 * seen the press report before we release it */
-                if (ep1_in_ready && now >= s_ut_deadline) {
+                /* wait for IN-complete AND hold time before releasing, so the
+                 * host is guaranteed to have seen the press report */
+                if (ep1_in_ready && (int32_t)(now - s_ut_deadline) >= 0) {
                     /* release all keys */
                     uint8_t *p = Ep1InBuffer;
                     p[0]=0; p[1]=0; p[2]=0; p[3]=0; p[4]=0; p[5]=0; p[6]=0; p[7]=0;
@@ -624,12 +769,14 @@ void usb_composite_task(void)
                     R8_UEP1_CTRL = (R8_UEP1_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_ACK;
                     s_ut_typed++;
                     s_ut_step = USB_STEP_WAIT_REL;
-                    s_ut_deadline = now + USB_STEP_DELAY_US;
+                    s_ut_deadline = now + USB_STEP_DELAY_MS;
+                    USB_LOG("[USB] up '%c' (%d/%d)\r\n",
+                            s_ut_buf[s_ut_idx], s_ut_typed, s_ut_len);
                 }
                 break;
 
             case USB_STEP_WAIT_REL:
-                if (ep1_in_ready && now >= s_ut_deadline) {
+                if (ep1_in_ready && (int32_t)(now - s_ut_deadline) >= 0) {
                     s_ut_step = USB_STEP_NEXT;
                 }
                 break;
@@ -659,6 +806,22 @@ void usb_composite_task(void)
  *      Note: `usb_hid_send_key` is kept for compatibility and still does
  *      a *single character's* full press-release dance in one blocking
  *      call, but usb_hid_send_text() now uses the async state machine. */
+/* wait for the EP1 IN completion flag; return 0 on timeout (~100ms).
+ * `ep1_in_ready` is set by the deferred task when the host has polled the
+ * report.  If the device is not enumerated, the host never polls and this
+ * would loop forever, so bail out. */
+static uint8_t usb_wait_ep1_in_ready(void)
+{
+    uint32_t t0 = TMOS_GetSystemClock();
+    while (!ep1_in_ready) {
+        usb_composite_task();
+        if ((int32_t)(TMOS_GetSystemClock() - t0) > 100) {
+            return 0;   /* ~100ms timeout */
+        }
+    }
+    return 1;
+}
+
 void usb_hid_send_key(uint8_t modifier, uint8_t keycode)
 {
     uint8_t *p = Ep1InBuffer;
@@ -676,8 +839,10 @@ void usb_hid_send_key(uint8_t modifier, uint8_t keycode)
     R8_UEP1_T_LEN = 8;
     R8_UEP1_CTRL = (R8_UEP1_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_ACK;
     /* pump the deferred queue while waiting for IN completion */
-    while (!ep1_in_ready) {
-        usb_composite_task();
+    if (!usb_wait_ep1_in_ready()) {
+        /* not enumerated / no host polling: leave EP1 NAK'd and bail out */
+        R8_UEP1_CTRL = (R8_UEP1_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_NAK;
+        return;
     }
 
     /* release report */
@@ -692,9 +857,7 @@ void usb_hid_send_key(uint8_t modifier, uint8_t keycode)
     ep1_in_ready = 0;
     R8_UEP1_T_LEN = 8;
     R8_UEP1_CTRL = (R8_UEP1_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_ACK;
-    while (!ep1_in_ready) {
-        usb_composite_task();
-    }
+    usb_wait_ep1_in_ready();
 }
 
 #define HID_MOD_LSHIFT 0x02
@@ -792,42 +955,41 @@ int usb_hid_type_progress(void)
 int usb_cdc_send(const uint8_t *buf, uint16_t len)
 {
     uint16_t i;
-    uint8_t *p = Ep3InBuffer;
+    uint16_t head;
 
     if (!buf || len == 0) return 0;
-    if (len > 64) len = 64;
+    if (!usb_dev_config) return 0;             /* not enumerated: drop  */
 
+    head = cdc_tx_head;
     for (i = 0; i < len; i++) {
-        p[i] = buf[i];
+        uint16_t next = (uint16_t)(head + 1);
+        if (next >= CDC_TX_RING_SIZE) next = 0;
+        if (next == cdc_tx_tail) return (int)i;   /* ring full: send what fit */
+        cdc_tx_ring[head] = buf[i];
+        head = next;
     }
-    ep3_in_ready = 0;
-    R8_UEP3_T_LEN = (uint8_t)len;
-    R8_UEP3_CTRL = (R8_UEP3_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_ACK;
-    while (!ep3_in_ready) {
-        usb_composite_task();
-    }
+    cdc_tx_head = head;
     return (int)len;
 }
 
 int usb_cdc_recv(uint8_t *buf, uint16_t maxlen)
 {
-    uint16_t n;
-    uint16_t i;
+    uint16_t n = 0;
 
     if (!buf) return 0;
 
-    n = cdc_rx_len;
-    if (n > maxlen) n = maxlen;
-    for (i = 0; i < n; i++) {
-        buf[i] = cdc_rx_buf[i];
+    while (n < maxlen && cdc_rx_tail != cdc_rx_head) {
+        buf[n++] = cdc_rx_ring[cdc_rx_tail];
+        if (++cdc_rx_tail >= CDC_RX_RING_SIZE) cdc_rx_tail = 0;
     }
-    cdc_rx_len = 0;
     return (int)n;
 }
 
 uint8_t usb_cdc_available(void)
 {
-    return (uint8_t)cdc_rx_len;
+    uint16_t head = cdc_rx_head;
+    uint16_t tail = cdc_rx_tail;
+    return (uint8_t)((uint16_t)(head - tail) & (CDC_RX_RING_SIZE - 1));
 }
 
 uint8_t usb_cdc_connected(void)

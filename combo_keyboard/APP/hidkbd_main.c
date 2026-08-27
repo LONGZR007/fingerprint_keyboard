@@ -46,6 +46,15 @@ static uint16_t CliTask_ProcessEvent(uint8_t task_id, uint16_t events)
     if (events & CLI_TASK_EVT_POLL) {
         /* Drain UART ring -> line edit -> run command if line ready */
         cli_uart_drain();
+        /* Drain USB CDC serial (ttyACM0) into the same CLI line editor */
+        {
+            uint8_t cdc_buf[64];
+            int n;
+            while ((n = usb_cdc_recv(cdc_buf, sizeof(cdc_buf))) > 0) {
+                int i;
+                for (i = 0; i < n; i++) cli_rx_byte(cdc_buf[i]);
+            }
+        }
         cli_task();
         /* re-arm the poll tick */
         tmos_start_task(cli_task_id, CLI_TASK_EVT_POLL, CLI_POLL_MS);

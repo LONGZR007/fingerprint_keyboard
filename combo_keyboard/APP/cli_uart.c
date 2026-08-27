@@ -10,6 +10,7 @@
  *                        high-throughput)
  *******************************************************************************/
 #include "cli_uart.h"
+#include "usb_composite.h"
 
 #include <string.h>
 
@@ -250,13 +251,20 @@ void cli_uart_putc(uint8_t b)
     }
 }
 
-/* CLI core TX entry: send a raw buffer via the same UART.
+/* CLI core TX entry: send a raw buffer via UART1 AND mirror it to the
+ * USB CDC serial port (non-blocking queue) so the same CLI works on both.
  * This strong definition overrides the weak default in cli.c (which would
  * otherwise use putchar/fflush — unavailable on bare metal). */
 void cli_tx_raw(const char *data, uint16_t len)
 {
-    if (!s_ready) return;
-    while (len--) {
-        cli_uart_putc((uint8_t)*data++);
+    if (s_ready) {
+        const char *p = data;
+        uint16_t l = len;
+        while (l--) {
+            cli_uart_putc((uint8_t)*p++);
+        }
     }
+    /* mirror to USB CDC (ttyACM0). usb_cdc_send() is non-blocking; data is
+     * queued and flushed from usb_composite_task(). */
+    usb_cdc_send((const uint8_t *)data, len);
 }
