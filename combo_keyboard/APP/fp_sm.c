@@ -36,6 +36,8 @@ static uint16_t s_target_id;    /* 目标 PageID（注册/删除用） */
 static fp_rx_t s_rx;            /* 接收应答缓冲 */
 static uint32_t s_wait_start;   /* 等待起始时间（用于超时） */
 static uint32_t s_tick;         /* 全局 tick 计数器（5ms 周期递增） */
+static fp_state_t s_pending_state; /* 取消后要切换到的状态, FP_IDLE=无(回到验证) */
+static uint16_t   s_pending_id;    /* 待执行操作的目标 ID (enroll/delete 用) */
 
 /* ===== fp_proto 回调函数（注册到 fp_proto） ===== */
 static void on_packet_cb(uint8_t pid, const uint8_t *data, uint16_t len) {
