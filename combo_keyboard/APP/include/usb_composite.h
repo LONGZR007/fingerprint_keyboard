@@ -8,14 +8,16 @@ void usb_hid_send_key(uint8_t modifier, uint8_t keycode);
 
 /*
  * Schedule a NUL-terminated ASCII string for async transmission via the
- * USB HID keyboard endpoint.  Returns the number of chars scheduled, or
- * 0 if the text is empty or a previous job is still running.
+ * USB HID keyboard endpoint.  The text is parsed like BLE hidkbd_type_text:
+ * plain chars are typed 1:1, "enter"/"esc" style special keys are expanded,
+ * and \" / \\ escapes are supported.  Returns the number of keys scheduled,
+ * or 0 if the text is empty or a previous job is still running.
  */
 int usb_hid_send_text(const char *text);
 
 /*
  * Query whether an async usb_hid_send_text() job is in flight, and how
- * many characters have been successfully emitted so far.
+ * many keys have been successfully emitted so far.
  */
 int usb_hid_type_busy(void);
 int usb_hid_type_progress(void);

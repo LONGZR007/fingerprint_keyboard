@@ -85,7 +85,7 @@ void user_flash_init(void)
      * 需格式化时由 CLI "user clear" 完成 */
 }
 
-BOOL user_flash_set(uint8_t id, const char *name, const uint8_t *data)
+BOOL user_flash_set(uint8_t id, const char *name, const uint8_t *data, kbd_channel_t ch)
 {
     if (id >= USER_FLASH_MAX_USERS) {
         return FALSE;
@@ -98,13 +98,15 @@ BOOL user_flash_set(uint8_t id, const char *name, const uint8_t *data)
     memset(s_rec_buf, 0, USER_SLOT_SIZE);
     /* 用户名: 复制最多 16 字节, strncpy 自动用 \0 填充不足部分 */
     strncpy((char *)s_rec_buf, name, USER_NAME_SIZE);
-    /* 用户数据: 复制最多 112 字节, 字符串方式 (遇 \0 停止, 避免越界读源) */
+    /* 用户数据: 复制最多 111 字节, 字符串方式 (遇 \0 停止, 避免越界读源) */
     strncpy((char *)(s_rec_buf + USER_NAME_SIZE), (const char *)data, USER_DATA_SIZE);
+    /* 上报通道: 存于记录末尾 1 字节, 仅保留 BLE/USB 位 */
+    s_rec_buf[USER_CHANNEL_OFFSET] = (uint8_t)(ch & KBD_CH_BOTH);
 
     return user_flash_page_rmw(id, s_rec_buf);
 }
 
-BOOL user_flash_get(uint8_t id, char *name, uint8_t *data)
+BOOL user_flash_get(uint8_t id, char *name, uint8_t *data, kbd_channel_t *ch)
 {
     if (id >= USER_FLASH_MAX_USERS) {
         return FALSE;
@@ -128,6 +130,10 @@ BOOL user_flash_get(uint8_t id, char *name, uint8_t *data)
     if (data) {
         memcpy(data, s_rec_buf + USER_NAME_SIZE, USER_DATA_SIZE);
         data[USER_DATA_SIZE - 1] = '\0';
+    }
+    if (ch) {
+        /* 仅保留 BLE/USB 位; 旧数据/未设置时该字节可能为 0xFF 或 0, 由调用方回退默认 */
+        *ch = (kbd_channel_t)(s_rec_buf[USER_CHANNEL_OFFSET] & KBD_CH_BOTH);
     }
     return TRUE;
 }

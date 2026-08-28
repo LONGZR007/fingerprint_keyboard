@@ -26,6 +26,7 @@ static const char *fp_state_name(fp_state_t s)
     case FP_DELETE_ONE: return "DELETE";
     case FP_CLEAR_ALL:  return "CLEAR";
     case FP_CANCEL:     return "CANCEL";
+    case FP_BLN_SET:    return "BLN_SET";
     default:            return "UNKNOWN";
     }
 }
@@ -68,9 +69,15 @@ static void fp_msg_handler(fp_msg_t msg, uint16_t param1, uint16_t param2)
         {
             static char    name_buf[USER_NAME_SIZE];
             static uint8_t data_buf[USER_DATA_SIZE];
-            if (user_flash_get((uint8_t)param1, name_buf, data_buf)) {
-                cli_print("[FP] 用户 \"%s\" 数据已加载, 开始发送\r\n", name_buf);
-                keyboard_type((const char *)data_buf);
+            kbd_channel_t ch = KBD_CH_NONE;
+            if (user_flash_get((uint8_t)param1, name_buf, data_buf, &ch)) {
+                /* 通道无效(旧数据/未设置)或未选通道时回退当前默认通道 */
+                if ((ch & KBD_CH_BOTH) != ch || ch == KBD_CH_NONE) {
+                    ch = keyboard_get_channel();
+                }
+                cli_print("[FP] 用户 \"%s\" 数据已加载, 通道=%s, 开始发送\r\n",
+                          name_buf, keyboard_channel_name(ch));
+                keyboard_type_text((const char *)data_buf, ch);
             } else {
                 cli_print("[FP] 用户 ID=%u 无数据\r\n", (unsigned)param1);
             }
@@ -107,6 +114,15 @@ static void fp_msg_handler(fp_msg_t msg, uint16_t param1, uint16_t param2)
 
     case FP_MSG_BUSY:
         cli_print("[FP] 忙, 请先完成当前操作\r\n");
+        break;
+
+    case FP_MSG_BLN_OK:
+        cli_print("[FP] 呼吸灯已设为 %s模式\r\n",
+                  param1 == 0xFF ? "自动" : "手动");
+        break;
+
+    case FP_MSG_BLN_FAIL:
+        cli_print("[FP] 呼吸灯模式设置失败, code=0x%02X\r\n", (unsigned)param1);
         break;
 
     default:
@@ -196,6 +212,34 @@ static int cmd_fp_cancel(int argc, char *argv[])
 }
 
 CLI_CMD_REGISTER("fp_cancel", cmd_fp_cancel, "fp_cancel             cancel current operation");
+
+static int cmd_fp_bln(int argc, char *argv[])
+{
+    if (argc < 2) {
+        cli_print("  usage: fp_bln <auto|manual>\r\n"
+                  "         auto   = 模组自动呼吸(默认, 上电自动模式)\r\n"
+                  "         manual = 手动模式(掉电保存, 由 PS_ControlBLN 控制)\r\n");
+        return 0;
+    }
+    BOOL auto_mode;
+    if (!strcmp(argv[1], "auto")   || !strcmp(argv[1], "a") || !strcmp(argv[1], "1")) {
+        auto_mode = TRUE;
+    } else if (!strcmp(argv[1], "manual") || !strcmp(argv[1], "m") || !strcmp(argv[1], "0")) {
+        auto_mode = FALSE;
+    } else {
+        cli_print("  invalid mode '%s' (auto|manual)\r\n", argv[1]);
+        return -1;
+    }
+    if (fp_sm_set_bln_mode(auto_mode)) {
+        cli_print("  fp_bln: switching to %s mode...\r\n", auto_mode ? "auto" : "manual");
+    } else {
+        cli_print("  fp busy, cannot set bln mode now\r\n");
+        return -1;
+    }
+    return 0;
+}
+
+CLI_CMD_REGISTER("fp_bln", cmd_fp_bln, "fp_bln <auto|manual>     set fingerprint breathing-light mode");
 
 /* =======================================================================
  * 初始化入口

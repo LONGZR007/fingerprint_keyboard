@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "user_flash.h"
+#include "keyboard_dispatch.h"
 
 /* =======================================================================
  * 参数解析 (十进制/十六进制)
@@ -33,6 +34,19 @@ static BOOL parse_id(const char *s, uint8_t *id_out)
     return TRUE;
 }
 
+/* 解析上报通道: 支持 none/ble/usb/both 或数字 0~3 */
+static BOOL parse_channel(const char *s, kbd_channel_t *ch_out)
+{
+    if (!s) return FALSE;
+    if (!strcmp(s, "none")) { *ch_out = KBD_CH_NONE; return TRUE; }
+    if (!strcmp(s, "ble"))  { *ch_out = KBD_CH_BLE;  return TRUE; }
+    if (!strcmp(s, "usb"))  { *ch_out = KBD_CH_USB;  return TRUE; }
+    if (!strcmp(s, "both")) { *ch_out = KBD_CH_BOTH; return TRUE; }
+    long v = parse_num(s);
+    if (v >= 0 && v <= 3) { *ch_out = (kbd_channel_t)v; return TRUE; }
+    return FALSE;
+}
+
 /* =======================================================================
  * user 命令实现
  * ===================================================================== */
@@ -41,7 +55,8 @@ static int cmd_user(int argc, char *argv[])
     /* 无参数或 help 子命令: 输出子命令列表 */
     if (argc < 2 || !strcmp(argv[1], "help")) {
         cli_print("  user subcommands:\r\n");
-        cli_print("    user set <id> <name> <data...>   设置用户 (name<=15, data<=111)\r\n");
+        cli_print("    user set <id> <name> <ch> <data...>  设置用户 (name<=15, data<=110)\r\n");
+        cli_print("      ch: none|ble|usb|both (或 0~3)\r\n");
         cli_print("    user get <id>                    读取用户\r\n");
         cli_print("    user del <id>                    删除指定用户\r\n");
         cli_print("    user clear                       清空全部用户\r\n");
@@ -51,20 +66,27 @@ static int cmd_user(int argc, char *argv[])
         return 0;
     }
 
-    /* ---- set <id> <name> <data...> ---- */
+    /* ---- set <id> <name> <ch> <data...> ---- */
     if (!strcmp(argv[1], "set")) {
-        if (argc < 5) {
-            cli_print("  usage: user set <id> <name> <data...>\r\n");
+        if (argc < 6) {
+            cli_print("  usage: user set <id> <name> <ch> <data...>\r\n"
+                      "         ch = none|ble|usb|both (或 0~3)\r\n");
             return -1;
         }
         uint8_t id;
         if (!parse_id(argv[2], &id)) return -1;
 
-        /* 拼接 argv[4..argc-1] 为 data 字符串 (空格分隔) */
+        kbd_channel_t ch;
+        if (!parse_channel(argv[4], &ch)) {
+            cli_print("  invalid channel '%s' (none|ble|usb|both)\r\n", argv[4]);
+            return -1;
+        }
+
+        /* 拼接 argv[5..argc-1] 为 data 字符串 (空格分隔) */
         static char data_buf[USER_DATA_SIZE];
         int n = 0;
-        for (int i = 4; i < argc && n < (int)(sizeof(data_buf) - 1); i++) {
-            if (i > 4 && n < (int)(sizeof(data_buf) - 1)) {
+        for (int i = 5; i < argc && n < (int)(sizeof(data_buf) - 1); i++) {
+            if (i > 5 && n < (int)(sizeof(data_buf) - 1)) {
                 data_buf[n++] = ' ';
             }
             for (const char *p = argv[i]; *p && n < (int)(sizeof(data_buf) - 1); p++) {
@@ -73,9 +95,9 @@ static int cmd_user(int argc, char *argv[])
         }
         data_buf[n] = '\0';
 
-        if (user_flash_set(id, argv[3], (const uint8_t *)data_buf)) {
-            cli_print("  user set ok, id=%u name=\"%s\" data=\"%s\"\r\n",
-                      (unsigned)id, argv[3], data_buf);
+        if (user_flash_set(id, argv[3], (const uint8_t *)data_buf, ch)) {
+            cli_print("  user set ok, id=%u name=\"%s\" ch=%s data=\"%s\"\r\n",
+                      (unsigned)id, argv[3], keyboard_channel_name(ch), data_buf);
         } else {
             cli_print("  user set FAILED (id=%u)\r\n", (unsigned)id);
             return -1;
@@ -94,9 +116,10 @@ static int cmd_user(int argc, char *argv[])
 
         static char name_buf[USER_NAME_SIZE];
         static uint8_t data_buf[USER_DATA_SIZE];
-        if (user_flash_get(id, name_buf, data_buf)) {
-            cli_print("  id=%u name=\"%s\" data=\"%s\"\r\n",
-                      (unsigned)id, name_buf, (char *)data_buf);
+        kbd_channel_t ch = KBD_CH_NONE;
+        if (user_flash_get(id, name_buf, data_buf, &ch)) {
+            cli_print("  id=%u name=\"%s\" ch=%s data=\"%s\"\r\n",
+                      (unsigned)id, name_buf, keyboard_channel_name(ch), (char *)data_buf);
         } else {
             cli_print("  id=%u empty\r\n", (unsigned)id);
         }
@@ -138,11 +161,12 @@ static int cmd_user(int argc, char *argv[])
         uint8_t n = 0;
         static char name_buf[USER_NAME_SIZE];
         static uint8_t data_buf[USER_DATA_SIZE];
-        cli_print("  %-4s %-16s %s\r\n", "id", "name", "data");
+        kbd_channel_t ch = KBD_CH_NONE;
+        cli_print("  %-4s %-16s %-5s %s\r\n", "id", "name", "ch", "data");
         for (uint8_t id = 0; id < USER_FLASH_MAX_USERS; id++) {
-            if (user_flash_get(id, name_buf, data_buf)) {
-                cli_print("  %-4u %-16s %s\r\n",
-                          (unsigned)id, name_buf, (char *)data_buf);
+            if (user_flash_get(id, name_buf, data_buf, &ch)) {
+                cli_print("  %-4u %-16s %-5s %s\r\n",
+                          (unsigned)id, name_buf, keyboard_channel_name(ch), (char *)data_buf);
                 n++;
             }
         }

@@ -55,6 +55,15 @@ typedef uint8_t cli_ble_status_t;
 #define GAPROLE_ADVERT_ENABLED  0x01
 #endif
 
+/* HidDev_SetParameter lives in Profile/hiddev.c; keep this file header-only
+ * (same reason as above) and declare just the subset we use.
+ * HIDDEV_ERASE_ALLBONDS drops the link (if connected) and erases every
+ * bonded device from flash. */
+extern uint8_t HidDev_SetParameter(uint8_t param, uint8_t len, void *pValue);
+#ifndef HIDDEV_ERASE_ALLBONDS
+#define HIDDEV_ERASE_ALLBONDS   0
+#endif
+
 /* ---- cli_uart_set_baud: implemented via HAL cli_uart.h API --------------- */
 #include "cli_uart.h"
 #include "CH58x_uart.h"
@@ -265,6 +274,119 @@ static int cmd_channel(int argc, char *argv[])
     return 0;
 }
 
+/* --- bond -------------------------------------------------------------- */
+static const char *bond_state_name(uint8_t st)
+{
+    switch (st & GAPROLE_STATE_ADV_MASK)
+    {
+    case GAPROLE_INIT:          return "INIT";
+    case GAPROLE_STARTED:       return "STARTED";
+    case GAPROLE_ADVERTISING:   return "ADVERTISING";
+    case GAPROLE_WAITING:       return "WAITING";
+    case GAPROLE_CONNECTED:     return "CONNECTED";
+    case GAPROLE_CONNECTED_ADV: return "CONNECTED_ADV";
+    default:                    return "?";
+    }
+}
+
+/* Parse "aa:bb:cc:dd:ee:ff" or "aabbccddeeff" into 6 bytes. */
+static int bond_parse_addr(const char *s, uint8_t *out)
+{
+    int n = 0;
+    const char *p = s;
+    while (*p && n < 6) {
+        unsigned v = 0;
+        int k;
+        for (k = 0; k < 2 && *p && *p != ':'; k++, p++) {
+            char c = *p;
+            if      (c >= '0' && c <= '9') v = v * 16 + (unsigned)(c - '0');
+            else if (c >= 'a' && c <= 'f') v = v * 16 + (unsigned)(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') v = v * 16 + (unsigned)(c - 'A' + 10);
+            else return -1;
+        }
+        if (k != 2) return -1;
+        out[n++] = (uint8_t)v;
+        if (*p == ':') p++;
+    }
+    return (*p == '\0' && n == 6) ? 0 : -1;
+}
+
+static int cmd_bond(int argc, char *argv[])
+{
+    /* no args: report bond count + GAP state */
+    if (argc < 2) {
+        uint8_t cnt = 0, st = 0;
+        GAPBondMgr_GetParameter(GAPBOND_BOND_COUNT, &cnt);
+        GAPRole_GetParameter(GAPROLE_STATE, &st);
+        cli_print("  bonded devices: %u\r\n", (unsigned)cnt);
+        cli_print("  GAP state     : %s\r\n", bond_state_name(st));
+        cli_print("  usage: bond <clear|count|erase [random] <addr>>\r\n");
+        return 0;
+    }
+
+    if (!strcmp(argv[1], "count")) {
+        uint8_t cnt = 0;
+        GAPBondMgr_GetParameter(GAPBOND_BOND_COUNT, &cnt);
+        cli_print("  bonded devices: %u\r\n", (unsigned)cnt);
+        return 0;
+    }
+
+    if (!strcmp(argv[1], "clear")) {
+        uint8_t st = 0;
+        GAPRole_GetParameter(GAPROLE_STATE, &st);
+        cli_print("  state: %s -> erasing all bonds", bond_state_name(st));
+        if ((st & GAPROLE_STATE_ADV_MASK) == GAPROLE_CONNECTED ||
+            (st & GAPROLE_STATE_ADV_MASK) == GAPROLE_CONNECTED_ADV) {
+            cli_print(" (link will be dropped)");
+        }
+        cli_print("\r\n");
+
+        /* Drop the link if connected and erase all bonded devices from
+         * flash.  On disconnect the HID app state callback restarts
+         * advertising, so the device re-enters "waiting for pairing". */
+        HidDev_SetParameter(HIDDEV_ERASE_ALLBONDS, 0, NULL);
+
+        /* Belt & braces: make sure advertising comes back up so the
+         * device is immediately discoverable / pairable again. */
+        {
+            uint8_t adv = 1;
+            GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t), &adv);
+        }
+        return 0;
+    }
+
+    if (!strcmp(argv[1], "erase")) {
+        if (argc < 3) {
+            cli_print("  usage: bond erase [random] <aa:bb:cc:dd:ee:ff>\r\n");
+            return -1;
+        }
+        int type = ADDRTYPE_PUBLIC;
+        const char *mac = argv[2];
+        if (!strcmp(argv[2], "random") || !strcmp(argv[2], "static")) {
+            type = ADDRTYPE_STATIC;
+            if (argc < 4) {
+                cli_print("  usage: bond erase [random] <aa:bb:cc:dd:ee:ff>\r\n");
+                return -1;
+            }
+            mac = argv[3];
+        }
+        uint8_t entry[7];
+        entry[0] = (uint8_t)type;
+        if (bond_parse_addr(mac, &entry[1]) != 0) {
+            cli_print("  bad address '%s' (use aa:bb:cc:dd:ee:ff)\r\n", mac);
+            return -1;
+        }
+        GAPBondMgr_SetParameter(GAPBOND_ERASE_SINGLEBOND, sizeof(entry), entry);
+        cli_print("  erased bond for %s%02X:%02X:%02X:%02X:%02X:%02X\r\n",
+                  type == ADDRTYPE_STATIC ? "random " : "",
+                  entry[1], entry[2], entry[3], entry[4], entry[5], entry[6]);
+        return 0;
+    }
+
+    cli_print("  usage: bond <clear|count|erase [random] <addr>>\r\n");
+    return -1;
+}
+
 /* =======================================================================
  * Static command registration via linker section ("cli_cmds").
  * No runtime registration call needed: cli core discovers these through
@@ -275,6 +397,7 @@ static int cmd_channel(int argc, char *argv[])
 CLI_CMD_REGISTER("echo",    cmd_echo,    "echo <words...>          print arguments");
 CLI_CMD_REGISTER("type",    cmd_type,    "type <words...>          HID-type string (letters/digits/symbols)");
 CLI_CMD_REGISTER("channel", cmd_channel, "channel [ble|usb|both]   set HID output channel");
+CLI_CMD_REGISTER("bond",    cmd_bond,    "bond <clear|count|erase> manage BLE bonding / re-enter pairing");
 CLI_CMD_REGISTER("info",    cmd_info,    "show build / hw / BLE info");
 CLI_CMD_REGISTER("reset",   cmd_reset,   "software reset MCU");
 CLI_CMD_REGISTER("adv",     cmd_adv,     "adv [on|off]             control BLE advertising");

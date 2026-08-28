@@ -188,6 +188,9 @@ static void cdc_tx_pump(void)
  *
  * 与 BLE hidkbd_type_text 状态机一致：
  *   PRESS -> WAIT_PRESS -> RELEASE -> WAIT_RELEASE -> NEXT -> PRESS
+ * 文本在入队时被 usb_hid_parse 预解析为 HID 按键序列
+ * （普通字符一对一、"enter"/"esc" 等特殊键、\" 转义），
+ * 状态机只消费预解析好的 (modifier, keycode)。
  * 每次 usb_composite_task() 调用最多推进一步，绝不阻塞。
  * 两个 WAIT 阶段靠系统时钟轮询 ~1ms 间隔（全速 USB 典型 bulk 节奏）。
  * 不使用 busy-loop 的 DelayUs，避免抢占 BLE 调度。 */
@@ -199,13 +202,55 @@ static void cdc_tx_pump(void)
 #define USB_STEP_NEXT      4
 #define USB_STEP_DELAY_MS  25UL   /* press/release hold time, ms */
 
-static char     s_ut_buf[USB_TYPE_BUF_SIZE];
-static uint16_t s_ut_len    = 0;
+/* 预解析的按键序列项: (HID modifier, HID keycode) */
+typedef struct {
+    uint8_t mod;
+    uint8_t kc;
+} usb_kbd_seq_key_t;
+
+/* 特殊键名表: "enter" -> 回车, "esc" -> ESC ... 键名大小写不敏感 */
+typedef struct {
+    const char *name;
+    uint8_t     keycode;
+} usb_hid_special_key_t;
+
+static const usb_hid_special_key_t s_usb_special_keys[] = {
+    { "enter",     0x28 },  /* Enter / Return      */
+    { "esc",       0x29 },  /* Escape              */
+    { "backspace", 0x2A },  /* Backspace           */
+    { "tab",       0x2B },  /* Tab                 */
+    { "space",     0x2C },  /* Space               */
+    { "capslock",  0x39 },  /* Caps Lock           */
+    { "insert",    0x49 },  /* Insert              */
+    { "home",      0x4A },  /* Home                */
+    { "pageup",    0x4B },  /* Page Up             */
+    { "delete",    0x4C },  /* Delete (Del)        */
+    { "end",       0x4D },  /* End                 */
+    { "pagedown",  0x4E },  /* Page Down           */
+    { "right",     0x4F },  /* Right Arrow         */
+    { "left",      0x50 },  /* Left Arrow          */
+    { "down",      0x51 },  /* Down Arrow          */
+    { "up",        0x52 },  /* Up Arrow            */
+    { "f1",        0x3A },  /* F1 ~ F12            */
+    { "f2",        0x3B },
+    { "f3",        0x3C },
+    { "f4",        0x3D },
+    { "f5",        0x3E },
+    { "f6",        0x3F },
+    { "f7",        0x40 },
+    { "f8",        0x41 },
+    { "f9",        0x42 },
+    { "f10",       0x43 },
+    { "f11",       0x44 },
+    { "f12",       0x45 },
+};
+
+#define USB_SPECIAL_KEY_NUM (sizeof(s_usb_special_keys) / sizeof(s_usb_special_keys[0]))
+
+static usb_kbd_seq_key_t s_ut_seq[USB_TYPE_BUF_SIZE];  /* 入队时预解析的按键序列 */
+static uint16_t s_ut_len    = 0;   /* 按键数（解析后） */
 static uint16_t s_ut_idx    = 0;
 static uint8_t  s_ut_step   = USB_STEP_PRESS;
-static uint8_t  s_ut_mod    = 0;
-static uint8_t  s_ut_kc     = 0;
-static uint8_t  s_ut_supp   = 0;
 static volatile uint8_t s_ut_busy = 0;
 static int       s_ut_typed = 0;
 static uint32_t  s_ut_deadline = 0;   /* ms deadline via TMOS_GetSystemClock */
@@ -738,23 +783,16 @@ void usb_composite_task(void)
         uint32_t now = TMOS_GetSystemClock();   /* ms counter (BLE lib) */
         switch (s_ut_step) {
             case USB_STEP_PRESS: {
-                char ch = s_ut_buf[s_ut_idx];
-                uint8_t mod = 0, kc = 0;
-                if (usb_ascii_to_hid(ch, &mod, &kc) == 0) {
-                    s_ut_supp = 1;
-                    s_ut_mod  = mod;
-                    s_ut_kc   = kc;
-                    uint8_t *p = Ep1InBuffer;
-                    p[0]=mod; p[1]=0; p[2]=kc; p[3]=0; p[4]=0; p[5]=0; p[6]=0; p[7]=0;
-                    ep1_in_ready = 0;
-                    R8_UEP1_T_LEN = 8;
-                    R8_UEP1_CTRL = (R8_UEP1_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_ACK;
-                    s_ut_step = USB_STEP_WAIT_PRESS;
-                    s_ut_deadline = now + USB_STEP_DELAY_MS;
-                } else {
-                    s_ut_supp = 0;
-                    s_ut_step = USB_STEP_NEXT;   /* skip unsupported char */
-                }
+                /* 按键码已在入队时预解析（含特殊键/转义），直接发送 */
+                uint8_t mod = s_ut_seq[s_ut_idx].mod;
+                uint8_t kc  = s_ut_seq[s_ut_idx].kc;
+                uint8_t *p = Ep1InBuffer;
+                p[0]=mod; p[1]=0; p[2]=kc; p[3]=0; p[4]=0; p[5]=0; p[6]=0; p[7]=0;
+                ep1_in_ready = 0;
+                R8_UEP1_T_LEN = 8;
+                R8_UEP1_CTRL = (R8_UEP1_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_ACK;
+                s_ut_step = USB_STEP_WAIT_PRESS;
+                s_ut_deadline = now + USB_STEP_DELAY_MS;
                 break;
             }
             case USB_STEP_WAIT_PRESS:
@@ -770,8 +808,9 @@ void usb_composite_task(void)
                     s_ut_typed++;
                     s_ut_step = USB_STEP_WAIT_REL;
                     s_ut_deadline = now + USB_STEP_DELAY_MS;
-                    USB_LOG("[USB] up '%c' (%d/%d)\r\n",
-                            s_ut_buf[s_ut_idx], s_ut_typed, s_ut_len);
+                    USB_LOG("[USB] up key %02X/%02X (%d/%d)\r\n",
+                            s_ut_seq[s_ut_idx].mod, s_ut_seq[s_ut_idx].kc,
+                            s_ut_typed, s_ut_len);
                 }
                 break;
 
@@ -920,26 +959,131 @@ static int usb_ascii_to_hid(char ch, uint8_t *modifier, uint8_t *keycode)
     return 0;
 }
 
+/*********************************************************************
+ * @fn      usb_hid_special_key_lookup
+ *
+ * @brief   在特殊键名表中查找 "name" token（大小写不敏感）。
+ *          命中则回填 HID 键码并返回 0，否则返回 -1。
+ */
+static int usb_hid_special_key_lookup(const char *name, uint16_t len, uint8_t *keycode)
+{
+    uint16_t i;
+    for (i = 0; i < USB_SPECIAL_KEY_NUM; i++) {
+        const char *n = s_usb_special_keys[i].name;
+        uint16_t j;
+        for (j = 0; j < len; j++) {
+            char a = name[j];
+            char b = n[j];
+            if (b == '\0') break;              /* 表项比 token 短 */
+            if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+            if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+            if (a != b) break;
+        }
+        if (j == len && n[j] == '\0') {        /* 完全匹配 */
+            *keycode = s_usb_special_keys[i].keycode;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/*********************************************************************
+ * @fn      usb_hid_parse
+ *
+ * @brief   把文本解析为 HID 按键序列 (modifier, keycode)。
+ *          与 BLE 端 hidkbd_parse 语法一致：
+ *            - 普通字符: usb_ascii_to_hid 一对一转换；
+ *            - "name":   特殊键 token，如 "enter" -> 回车、"esc" -> ESC、
+ *                        "f1"~"f12"、"tab"/"space"/方向键等，键名不区分大小写；
+ *            - \" 和 \\: 转义符，按单个字面量字符处理（\"enter\" 会按
+ *                        普通文本 enter 发送，不会被当作特殊键）；
+ *            - 其他 \x:   保持原样按普通字符发送；
+ *            - 无法转换/不支持的字符: 跳过不发送。
+ *
+ * @param   text - 待解析的 NUL 结尾字符串
+ * @param   seq  - 输出按键序列缓冲
+ * @param   max  - 序列缓冲容量上限
+ *
+ * @return  生成的按键数（0 表示无可发送内容）。
+ */
+static uint16_t usb_hid_parse(const char *text, usb_kbd_seq_key_t *seq, uint16_t max)
+{
+    uint16_t n = 0;
+    const char *p = text;
+
+    while (*p && n < max) {
+        /* 转义符: 仅 " 和 \ 有转义语义，其余 \x 保持原样 */
+        if (*p == '\\' && (p[1] == '"' || p[1] == '\\')) {
+            uint8_t mod = 0, kc = 0;
+            if (usb_ascii_to_hid(p[1], &mod, &kc) == 0) {
+                seq[n].mod = mod;
+                seq[n].kc  = kc;
+                n++;
+            }
+            p += 2;
+            continue;
+        }
+
+        /* 特殊键 token: "name" */
+        if (*p == '"') {
+            const char *start = p + 1;
+            const char *q     = start;
+            while (*q && *q != '"') q++;
+            if (*q == '"' && q != start) {
+                uint8_t kc;
+                if (usb_hid_special_key_lookup(start, (uint16_t)(q - start), &kc) == 0) {
+                    seq[n].mod = 0;
+                    seq[n].kc  = kc;
+                    n++;
+                    p = q + 1;
+                    continue;
+                }
+            }
+            /* 不是特殊键（或未闭合）: 引号按普通字符发送 */
+            {
+                uint8_t mod = 0, kc = 0;
+                if (usb_ascii_to_hid('"', &mod, &kc) == 0) {
+                    seq[n].mod = mod;
+                    seq[n].kc  = kc;
+                    n++;
+                }
+                p++;
+                continue;
+            }
+        }
+
+        /* 普通字符 */
+        {
+            uint8_t mod = 0, kc = 0;
+            if (usb_ascii_to_hid(*p, &mod, &kc) == 0) {
+                seq[n].mod = mod;
+                seq[n].kc  = kc;
+                n++;
+            }
+            p++;
+        }
+    }
+    return n;
+}
+
 /* ---- Async USB text-type scheduler ---------------------------------------
- *   不阻塞，立即返回。忙状态下重复调用直接丢弃返回 0。 ------------------- */
+ *   不阻塞，立即返回。忙状态下重复调用直接丢弃返回 0。
+ *   文本在入队时被 usb_hid_parse 预解析为按键序列，返回值为按键数。 ----- */
 int usb_hid_send_text(const char *text)
 {
     if (!text) return 0;
     if (s_ut_busy) return 0;
 
-    uint16_t len = 0;
-    while (text[len] && len < (USB_TYPE_BUF_SIZE - 1)) len++;
-    if (len == 0) return 0;
+    /* 转换: 字符 -> 键盘码, 支持 "enter"/"esc" 特殊键与 \" 转义 */
+    uint16_t n = usb_hid_parse(text, s_ut_seq, USB_TYPE_BUF_SIZE);
+    if (n == 0) return 0;
 
-    memcpy(s_ut_buf, text, len);
-    s_ut_buf[len] = '\0';
-
-    s_ut_len   = len;
+    s_ut_len   = n;   /* 按键数（解析后） */
     s_ut_idx   = 0;
     s_ut_step  = USB_STEP_PRESS;
     s_ut_typed = 0;
     s_ut_busy  = 1;
-    return (int)len;
+    return (int)n;
 }
 
 int usb_hid_type_busy(void)

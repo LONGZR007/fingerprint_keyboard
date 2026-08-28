@@ -22,7 +22,8 @@ typedef enum {
     FP_VERIFY,       /* 自动验证 */
     FP_DELETE_ONE,   /* 删除指定 */
     FP_CLEAR_ALL,    /* 清空全部 */
-    FP_CANCEL        /* 取消 */
+    FP_CANCEL,       /* 取消 */
+    FP_BLN_SET       /* 呼吸灯自动/手动模式设置 */
 } fp_state_t;
 
 /* ===== 消息通知类型 ===== */
@@ -38,7 +39,9 @@ typedef enum {
     FP_MSG_CLEAR_FAIL,       /* 清空失败, param1=确认码 */
     FP_MSG_TIMEOUT,          /* 超时 */
     FP_MSG_CANCELLED,        /* 已取消 */
-    FP_MSG_BUSY              /* 忙状态拒绝 */
+    FP_MSG_BUSY,             /* 忙状态拒绝 */
+    FP_MSG_BLN_OK,           /* 呼吸灯模式设置成功, param1=0xFF自动/0x00手动 */
+    FP_MSG_BLN_FAIL          /* 呼吸灯模式设置失败, param1=确认码 */
 } fp_msg_t;
 
 /* ===== 注册配置宏（方便修改） ===== */
@@ -92,6 +95,7 @@ BOOL fp_sm_verify(void);             /* 启动 1:N 验证 */
 BOOL fp_sm_delete(uint16_t page_id); /* 删除指定 ID */
 BOOL fp_sm_clear(void);              /* 清空全部 */
 BOOL fp_sm_cancel(void);             /* 取消当前操作 */
+BOOL fp_sm_set_bln_mode(BOOL auto_mode); /* 设置呼吸灯自动/手动模式, TRUE=自动 FALSE=手动 */
 fp_state_t fp_sm_get_state(void);    /* 查询当前状态 */
 void fp_sm_set_notify_cb(fp_notify_cb_t cb); /* 设置通知回调 */
 

@@ -7,8 +7,11 @@
 extern "C" {
 #endif
 
-/* 键盘发送通道标志（可按位组合） */
-typedef enum {
+/* 键盘发送通道标志（可按位组合）
+ * __attribute__((packed)): 强制枚举为最小宽度 (1 字节),
+ * 保证 sizeof(kbd_channel_t) == 1, 使 user_record_t 恰好 128B
+ * 与 Data-Flash 槽位大小 (USER_SLOT_SIZE) 一致 */
+typedef enum __attribute__((packed)) {
     KBD_CH_NONE = 0x00,
     KBD_CH_BLE  = 0x01,
     KBD_CH_USB  = 0x02,
