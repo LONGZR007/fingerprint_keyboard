@@ -162,11 +162,18 @@ static int cmd_user(int argc, char *argv[])
         static char name_buf[USER_NAME_SIZE];
         static uint8_t data_buf[USER_DATA_SIZE];
         kbd_channel_t ch = KBD_CH_NONE;
+        /* 星号串: 按用户数据实际长度遮蔽打印 (长度对齐 USER_DATA_SIZE=111) */
+        static const char STARS[] = "*************************************************************************************************************"; /* 111 */
         cli_print("  %-4s %-16s %-5s %s\r\n", "id", "name", "ch", "data");
         for (uint8_t id = 0; id < USER_FLASH_MAX_USERS; id++) {
             if (user_flash_get(id, name_buf, data_buf, &ch)) {
-                cli_print("  %-4u %-16s %-5s %s\r\n",
-                          (unsigned)id, name_buf, keyboard_channel_name(ch), (char *)data_buf);
+                /* 打印与用户数据等长的 '*' 遮蔽敏感内容 */
+                cli_print("  %-4u %-16s %-5s %.*s\r\n",
+                          (unsigned)id, name_buf, keyboard_channel_name(ch),
+                          (int)strlen((const char *)data_buf), STARS);
+                /* 需要查看原始数据时, 打开下面一行即可 */
+                /* cli_print("  %-4u %-16s %-5s %s\r\n",
+                          (unsigned)id, name_buf, keyboard_channel_name(ch), (char *)data_buf); */
                 n++;
             }
         }
