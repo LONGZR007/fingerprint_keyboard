@@ -8,3 +8,8 @@
 *.siz
 *.253r.expand
 callgraph.dot
+
+# Python（上位机 host_app）
+__pycache__/
+*.py[cod]
+*$py.class
