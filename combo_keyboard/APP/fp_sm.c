@@ -21,6 +21,7 @@
 #define CMD_CANCEL         0x30
 #define CMD_BLN_AUTO_MANUAL 0x60 /* 呼吸灯自动/手动切换: 参数 0xFF=自动, 0x00=手动 */
 #define CMD_BLN_CONTROL     0x3C /* 呼吸灯控制: 功能码(1B)+起始颜色(1B)+结束颜色(1B)+循环次数(1B) */
+#define CMD_READ_INDEX_TABLE 0x1f /* 读索引表: 页码(1B), 应答 32 字节索引信息 */
 
 /* 三色灯颜色位: bit0=蓝, bit1=绿, bit2=红 */
 #define FP_LED_GREEN        0x02
@@ -45,6 +46,7 @@ static uint32_t s_wait_start;   /* 等待起始时间（用于超时） */
 static uint32_t s_tick;         /* 全局 tick 计数器（5ms 周期递增） */
 static uint16_t   s_pending_id;    /* 待执行操作的目标 ID (enroll/delete 用) */
 static BOOL       s_bln_mode;      /* 呼吸灯模式: TRUE=自动(0xFF), FALSE=手动(0x00) */
+static uint8_t    s_index_table[FP_INDEX_TABLE_SIZE]; /* 读取到的全部索引表 */
 
 /* ===== fp_proto 回调函数（注册到 fp_proto） ===== */
 static void on_packet_cb(uint8_t pid, const uint8_t *data, uint16_t len) {
@@ -318,6 +320,43 @@ static PT_THREAD(pt_bln_set(struct pt *pt)) {
     PT_END(pt);  /* 结束由 fp_sm_task 统一切回 FP_IDLE */
 }
 
+/* ===== READ_INDEX protothread（读取全部索引表, 共 4 页） ===== */
+static PT_THREAD(pt_read_index(struct pt *pt)) {
+    static uint8_t buf[16];
+    static uint8_t params[1];  /* 页码 */
+    static uint8_t page;
+    uint16_t pkt_len;
+    uint8_t confirm;
+
+    PT_BEGIN(pt);
+
+    for (page = 0; page < FP_INDEX_PAGE_COUNT; page++) {
+        params[0] = page;
+        pkt_len = fp_proto_build_cmd(buf, CMD_READ_INDEX_TABLE, params, 1);
+        fp_uart_send(buf, pkt_len);
+
+        s_rx.ready = FALSE;
+        FP_WAIT_RESPONSE(pt, FP_WAIT_TIMEOUT_MS);
+
+        confirm = s_rx.data[0];
+        if (confirm != 0x00) {
+            if (s_notify) s_notify(FP_MSG_READ_INDEX_FAIL, confirm, page);
+            PT_EXIT(pt);
+        }
+        /* 复制 32 字节索引信息(data[1..32])到缓冲区 */
+        if (s_rx.len >= 33) {
+            memcpy(&s_index_table[page * 32], &s_rx.data[1], 32);
+        } else {
+            if (s_notify) s_notify(FP_MSG_READ_INDEX_FAIL, 0x01, page);
+            PT_EXIT(pt);
+        }
+    }
+
+    if (s_notify) s_notify(FP_MSG_READ_INDEX_OK, FP_INDEX_TABLE_SIZE, 0);
+
+    PT_END(pt);  /* 结束由 fp_sm_task 统一切回 FP_IDLE */
+}
+
 /* ===== 主任务函数：由主循环周期调用, 推进状态机 ===== */
 void fp_sm_task(void) {
     s_tick++;  /* 全局 tick 递增 (5ms周期) */
@@ -341,6 +380,9 @@ void fp_sm_task(void) {
         break;
     case FP_BLN_SET:
         if (!PT_SCHEDULE(pt_bln_set(&s_pt))) s_state = FP_IDLE;
+        break;
+    case FP_READ_INDEX:
+        if (!PT_SCHEDULE(pt_read_index(&s_pt))) s_state = FP_IDLE;
         break;
     default:
         break;  /* IDLE, 不调度 */
@@ -406,6 +448,21 @@ BOOL fp_sm_set_bln_mode(BOOL auto_mode) {
     s_state = FP_BLN_SET;
     PT_INIT(&s_pt);
     return TRUE;
+}
+
+BOOL fp_sm_read_index(void) {
+    if (s_state != FP_IDLE) {
+        if (s_notify) s_notify(FP_MSG_BUSY, 0, 0);
+        return FALSE;
+    }
+    memset(s_index_table, 0, sizeof(s_index_table));
+    s_state = FP_READ_INDEX;
+    PT_INIT(&s_pt);
+    return TRUE;
+}
+
+const uint8_t* fp_sm_get_index_table(void) {
+    return s_index_table;
 }
 
 fp_state_t fp_sm_get_state(void) {

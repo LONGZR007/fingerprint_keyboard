@@ -27,6 +27,7 @@ static const char *fp_state_name(fp_state_t s)
     case FP_CLEAR_ALL:  return "CLEAR";
     case FP_CANCEL:     return "CANCEL";
     case FP_BLN_SET:    return "BLN_SET";
+    case FP_READ_INDEX: return "READ_INDEX";
     default:            return "UNKNOWN";
     }
 }
@@ -123,6 +124,23 @@ static void fp_msg_handler(fp_msg_t msg, uint16_t param1, uint16_t param2)
 
     case FP_MSG_BLN_FAIL:
         cli_print("[FP] 呼吸灯模式设置失败, code=0x%02X\r\n", (unsigned)param1);
+        break;
+
+    case FP_MSG_READ_INDEX_OK: {
+        const uint8_t *idx = fp_sm_get_index_table();
+        cli_print("[FP] 索引表读取成功, 共 %u 字节:\r\n", (unsigned)FP_INDEX_TABLE_SIZE);
+        for (int i = 0; i < FP_INDEX_TABLE_SIZE; i++) {
+            cli_print("%02X ", (unsigned)idx[i]);
+            if ((i + 1) % 16 == 0) {
+                cli_print("\r\n");
+            }
+        }
+        break;
+    }
+
+    case FP_MSG_READ_INDEX_FAIL:
+        cli_print("[FP] 索引表读取失败, code=0x%02X, page=%u\r\n",
+                  (unsigned)param1, (unsigned)param2);
         break;
 
     default:
@@ -240,6 +258,20 @@ static int cmd_fp_bln(int argc, char *argv[])
 }
 
 CLI_CMD_REGISTER("fp_bln", cmd_fp_bln, "fp_bln <auto|manual>     set fingerprint breathing-light mode");
+
+static int cmd_fp_read_index(int argc, char *argv[])
+{
+    (void)argc;
+    (void)argv;
+    if (fp_sm_read_index()) {
+        cli_print("  fp_read_index started\r\n");
+    } else {
+        cli_print("  fp busy, cannot start read index\r\n");
+    }
+    return 0;
+}
+
+CLI_CMD_REGISTER("fp_read_index", cmd_fp_read_index, "fp_read_index          read all fingerprint index table");
 
 /* =======================================================================
  * 初始化入口

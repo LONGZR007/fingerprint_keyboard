@@ -174,14 +174,9 @@ static void cdc_tx_pump(void)
     ep3_in_ready = 0;
     R8_UEP3_T_LEN = (uint8_t)n;
     R8_UEP3_CTRL = (R8_UEP3_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_ACK;
-    /* DEBUG [CDC TX]: print every frame sent out EP3 to UART1 ONLY
-     * (never routed to CDC, no recursion). Format: [u<len hex>] */
-    {
-        static const char hexc[] = "0123456789ABCDEF";
-        cli_uart_putc('['); cli_uart_putc('u');
-        cli_uart_putc(hexc[(n >> 4) & 0x0F]); cli_uart_putc(hexc[n & 0x0F]);
-        cli_uart_putc(']');
-    }
+    /* RB_UEP_AUTO_TOG: hardware flips the TX toggle after this transfer
+     * completes, so the next frame only needs T_LEN + T_RES_ACK again.
+     * The IRQ restores T_RES=NAK on completion, so no stale re-send. */
 }
 
 /* ---- Async USB HID string-type state machine ----
@@ -567,9 +562,37 @@ void USB_IRQHandler(void)
             token = int_st & MASK_UIS_TOKEN;
             ep    = int_st & MASK_UIS_ENDP;
             len   = R8_USB_RX_LEN;
-            if (ep == 1 && token == UIS_TOKEN_IN)  usb_ep1in_irq++;
-            else if (ep == 3 && token == UIS_TOKEN_IN)  usb_ep3in_irq++;
-            else if (ep == 4 && token == UIS_TOKEN_OUT) usb_ep4out_irq++;
+            if (ep == 1 && token == UIS_TOKEN_IN) {
+                usb_ep1in_irq++;
+                /* Restore NAK right here, as the WCH examples do.  With
+                 * RB_UEP_AUTO_TOG the data toggle was already flipped by
+                 * hardware.  If ACK stayed armed until the deferred task
+                 * ran, the next IN poll from the host would re-transmit
+                 * the stale buffer with a *valid* toggle -> the host reads
+                 * duplicated data. */
+                R8_UEP1_CTRL = (R8_UEP1_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_NAK;
+            } else if (ep == 3 && token == UIS_TOKEN_IN) {
+                usb_ep3in_irq++;
+                R8_UEP3_CTRL = (R8_UEP3_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_NAK;
+            } else if (ep == 4 && token == UIS_TOKEN_OUT) {
+                if (int_st & RB_UIS_TOG_OK) {
+                    usb_ep4out_irq++;
+                    /* NAK now so the next OUT packet cannot overwrite
+                     * Ep4OutBuffer before the task copies it to the ring.
+                     * The host simply retries with NAK: no loss. */
+                    R8_UEP4_CTRL = (R8_UEP4_CTRL & ~MASK_UEP_R_RES) | UEP_R_RES_NAK;
+                } else {
+                    /* toggle-mismatched packet: nothing was received, keep
+                     * accepting (the task ignores this event) */
+                    R8_UEP4_CTRL = (R8_UEP4_CTRL & ~MASK_UEP_R_RES) | UEP_R_RES_ACK;
+                }
+            } else if (ep == 0 && token == UIS_TOKEN_IN && addr_pending) {
+                /* SET_ADDRESS status ZLP was just ACKed: apply the address
+                 * now, before the next (re-addressed) SETUP arrives - same
+                 * place as the WCH examples do it. */
+                R8_USB_DEV_AD = pending_addr;
+                addr_pending  = 0;
+            }
             /* push to ring buffer (drop if full) */
             uint8_t next = (uint8_t)(irq_head + 1);
             if (next >= IRQ_RING_SIZE) next = 0;
@@ -730,21 +753,23 @@ void usb_composite_task(void)
 
         case 1:
             if (evt.token == UIS_TOKEN_IN) {
+                /* NAK already restored in the IRQ; toggle flipped by
+                 * RB_UEP_AUTO_TOG.  Only the completion flag is needed. */
                 ep1_in_ready = 1;
-                R8_UEP1_CTRL = (R8_UEP1_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_NAK;
             }
             break;
 
         case 3:
             if (evt.token == UIS_TOKEN_IN) {
                 ep3_in_ready = 1;
-                R8_UEP3_CTRL = (R8_UEP3_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_NAK;
             }
             break;
 
         case 4:
             if (evt.token == UIS_TOKEN_OUT && evt.tog_ok) {
-                /* CDC data received on EP4 OUT -> RX ring */
+                /* CDC data received on EP4 OUT -> RX ring.  EP4 was NAK'd
+                 * by the IRQ right after reception, so Ep4OutBuffer cannot
+                 * be overwritten while we copy it out. */
                 uint8_t n = evt.len;
                 uint16_t head = cdc_rx_head;
                 for (uint8_t i = 0; i < n; i++) {
@@ -755,12 +780,11 @@ void usb_composite_task(void)
                     head = next;
                 }
                 cdc_rx_head = head;
-                /* re-arm EP4 OUT. EP4 has NO AUTO_TOG (like EP0), so the
-                 * expected RX toggle must be flipped by software after every
-                 * accepted packet, otherwise the host's next DATA1 packet is
-                 * rejected as a toggle error. */
-                R8_UEP4_CTRL = (R8_UEP4_CTRL & ~MASK_UEP_R_RES) | UEP_R_RES_ACK;
-                R8_UEP4_CTRL ^= RB_UEP_R_TOG;
+                /* re-arm EP4 OUT in one write: flip the expected RX toggle
+                 * (EP4 has NO AUTO_TOG, like EP0, so it must be flipped by
+                 * software) and go back to ACK. */
+                R8_UEP4_CTRL = ((R8_UEP4_CTRL ^ RB_UEP_R_TOG) & ~MASK_UEP_R_RES)
+                               | UEP_R_RES_ACK;
             }
             break;
 

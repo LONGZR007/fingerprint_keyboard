@@ -23,7 +23,8 @@ typedef enum {
     FP_DELETE_ONE,   /* 删除指定 */
     FP_CLEAR_ALL,    /* 清空全部 */
     FP_CANCEL,       /* 取消 */
-    FP_BLN_SET       /* 呼吸灯自动/手动模式设置 */
+    FP_BLN_SET,      /* 呼吸灯自动/手动模式设置 */
+    FP_READ_INDEX    /* 读取索引表 */
 } fp_state_t;
 
 /* ===== 消息通知类型 ===== */
@@ -41,7 +42,9 @@ typedef enum {
     FP_MSG_CANCELLED,        /* 已取消 */
     FP_MSG_BUSY,             /* 忙状态拒绝 */
     FP_MSG_BLN_OK,           /* 呼吸灯模式设置成功, param1=0xFF自动/0x00手动 */
-    FP_MSG_BLN_FAIL          /* 呼吸灯模式设置失败, param1=确认码 */
+    FP_MSG_BLN_FAIL,         /* 呼吸灯模式设置失败, param1=确认码 */
+    FP_MSG_READ_INDEX_OK,    /* 读取索引表成功, 可通过 fp_sm_get_index_table 获取数据 */
+    FP_MSG_READ_INDEX_FAIL   /* 读取索引表失败, param1=确认码, param2=失败页码 */
 } fp_msg_t;
 
 /* ===== 注册配置宏（方便修改） ===== */
@@ -84,6 +87,10 @@ typedef enum {
 /* 1:N 全库搜索的 TargetID */
 #define FP_SEARCH_ALL         0xFFFF
 
+/* 索引表页数与大小: 每页 32 字节(256 位), 共 4 页覆盖 0-1023 */
+#define FP_INDEX_PAGE_COUNT   4
+#define FP_INDEX_TABLE_SIZE   (FP_INDEX_PAGE_COUNT * 32)   /* 128 bytes */
+
 /* 回调类型: msg=消息类型, param1/param2=参数 */
 typedef void (*fp_notify_cb_t)(fp_msg_t msg, uint16_t param1, uint16_t param2);
 
@@ -96,6 +103,8 @@ BOOL fp_sm_delete(uint16_t page_id); /* 删除指定 ID */
 BOOL fp_sm_clear(void);              /* 清空全部 */
 BOOL fp_sm_cancel(void);             /* 取消当前操作 */
 BOOL fp_sm_set_bln_mode(BOOL auto_mode); /* 设置呼吸灯自动/手动模式, TRUE=自动 FALSE=手动 */
+BOOL fp_sm_read_index(void);             /* 启动读取全部索引表 */
+const uint8_t* fp_sm_get_index_table(void); /* 获取最近一次读取的索引表(128 字节) */
 fp_state_t fp_sm_get_state(void);    /* 查询当前状态 */
 void fp_sm_set_notify_cb(fp_notify_cb_t cb); /* 设置通知回调 */
 

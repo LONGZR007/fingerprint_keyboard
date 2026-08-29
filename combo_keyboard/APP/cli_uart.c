@@ -188,6 +188,7 @@ void CLI_UART_IRQHandler(void)
 
 void cli_uart_init(void)
 {
+#if (CLI_PORT_MASK & CLI_PORT_UART1)
     /* 1. TX pin (idle HIGH before enable to avoid framing glitch on host) */
     CLI_TX_SETHIGH();
     CLI_TX_MODECFG();
@@ -209,6 +210,7 @@ void cli_uart_init(void)
     PFIC_EnableIRQ(CLI_UART_IRQn);
 
     s_ready = TRUE;
+#endif
 }
 
 /* =======================================================================
@@ -257,6 +259,7 @@ void cli_uart_putc(uint8_t b)
  * otherwise use putchar/fflush — unavailable on bare metal). */
 void cli_tx_raw(const char *data, uint16_t len)
 {
+#if (CLI_PORT_MASK & CLI_PORT_UART1)
     if (s_ready) {
         const char *p = data;
         uint16_t l = len;
@@ -264,7 +267,10 @@ void cli_tx_raw(const char *data, uint16_t len)
             cli_uart_putc((uint8_t)*p++);
         }
     }
+#endif
+#if (CLI_PORT_MASK & CLI_PORT_CDC)
     /* mirror to USB CDC (ttyACM0). usb_cdc_send() is non-blocking; data is
      * queued and flushed from usb_composite_task(). */
     usb_cdc_send((const uint8_t *)data, len);
+#endif
 }

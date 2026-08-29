@@ -25,6 +25,19 @@ extern "C" {
 #define CLI_UART_PORT        1
 #endif
 
+/* =====================================================================
+ * CLI 串口通道选择（输入 + 输出统一由 CLI_PORT_MASK 控制）
+ *   CLI_PORT_UART1 : 仅 UART1（物理串口, CLI_UART_PORT 指定）
+ *   CLI_PORT_CDC   : 仅 USB CDC（ttyACM0）
+ *   CLI_PORT_BOTH  : 两路同时（默认）
+ * 编译时用 -DCLI_PORT_MASK=... 或直接改下面的默认值。
+ * =====================================================================*/
+#define CLI_PORT_UART1      0x01
+#define CLI_PORT_CDC        0x02
+#ifndef CLI_PORT_MASK
+#define CLI_PORT_MASK       (CLI_PORT_UART1 | CLI_PORT_CDC)
+#endif
+
 /* HAL configuration */
 #ifndef CLI_UART_BAUD
 #define CLI_UART_BAUD        115200

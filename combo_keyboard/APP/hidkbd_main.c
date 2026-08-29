@@ -44,8 +44,11 @@ static uint16_t CliTask_ProcessEvent(uint8_t task_id, uint16_t events)
 {
     (void)task_id;
     if (events & CLI_TASK_EVT_POLL) {
+#if (CLI_PORT_MASK & CLI_PORT_UART1)
         /* Drain UART ring -> line edit -> run command if line ready */
         cli_uart_drain();
+#endif
+#if (CLI_PORT_MASK & CLI_PORT_CDC)
         /* Drain USB CDC serial (ttyACM0) into the same CLI line editor */
         {
             uint8_t cdc_buf[64];
@@ -55,6 +58,7 @@ static uint16_t CliTask_ProcessEvent(uint8_t task_id, uint16_t events)
                 for (i = 0; i < n; i++) cli_rx_byte(cdc_buf[i]);
             }
         }
+#endif
         cli_task();
         /* re-arm the poll tick */
         tmos_start_task(cli_task_id, CLI_TASK_EVT_POLL, CLI_POLL_MS);
@@ -68,8 +72,15 @@ static void Cli_Init(void)
     cli_uart_init();
     cli_init();
     cli_task_id = TMOS_ProcessEventRegister(CliTask_ProcessEvent);
+#if (CLI_PORT_MASK == CLI_PORT_UART1)
     cli_print("\r\n=== CLI ready on UART%d %u 8N1 ===\r\n",
-              (int)1 /* CLI_UART_PORT */, (unsigned)CLI_UART_BAUD);
+              (int)CLI_UART_PORT, (unsigned)CLI_UART_BAUD);
+#elif (CLI_PORT_MASK == CLI_PORT_CDC)
+    cli_print("\r\n=== CLI ready on USB CDC (ttyACM0) ===\r\n");
+#else
+    cli_print("\r\n=== CLI ready on UART%d + USB CDC ===\r\n",
+              (int)CLI_UART_PORT);
+#endif
     cli_print("Type 'help' for a list of commands.\r\n");
     cli_print_prompt();
     /* kick off periodic drain */
