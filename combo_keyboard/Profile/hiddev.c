@@ -3,7 +3,7 @@
  * Author             : WCH
  * Version            : V1.0
  * Date               : 2018/12/10
- * Description        : HID 设备任务处理程序
+ * Description        : HID 璁惧浠诲姟澶勭悊绋嬪簭
  *********************************************************************************
  * Copyright (c) 2021 Nanjing Qinheng Microelectronics Co., Ltd.
  * Attention: This software (modified or not) and binary are used for 
@@ -44,9 +44,14 @@
 #define HID_HIGH_ADV_TIMEOUT              5
 #define HID_LOW_ADV_TIMEOUT               0
 
-// Heart Rate Task Events
+// HID Dev Task Events
 #define START_DEVICE_EVT                  0x0001
 #define BATT_PERIODIC_EVT                 0x0002
+#define PAIR_WINDOW_EVT                   0x0004   // pairing whitelist window timeout
+
+// Connected advertising interval (units of 625us): 1s low duty so the phone
+// can still find and connect to the device while the PC link is up.
+#define HID_CONNECTED_ADV_INT             1600
 
 /*********************************************************************
  * CONSTANTS
@@ -78,11 +83,27 @@ uint8_t hidDevTaskId;
 // GAP State
 static gapRole_States_t hidDevGapState = GAPROLE_INIT;
 
-// TRUE if connection is secure
-static uint8_t hidDevConnSecure = FALSE;
+// HID master (PC) connection handle.  Exactly one connection owns this
+// slot; HID keyboard reports are only ever sent over it.
+static uint16_t gapConnHandle = GAP_CONNHANDLE_INIT;
 
-// GAP connection handle
-static uint16_t gapConnHandle;
+// Monitor (phone) connection: handle slot + activated flag.  monActive is
+// set when the phone writes the Proximity Service Control characteristic.
+static uint16_t monConnHandle = GAP_CONNHANDLE_INIT;
+static uint8_t  monActive = FALSE;
+
+// Handle of the connection that last completed pairing/bonding.  The HID
+// master connection is considered secure only when the two handles match,
+// which stays correct even if the two slots are swapped at runtime.
+static uint16_t secConnHandle = GAP_CONNHANDLE_INIT;
+
+// Connection currently awaiting a passcode response
+static uint16_t passcodeConnHandle = GAP_CONNHANDLE_INIT;
+
+// Callbacks forwarded to the proximity module
+// (registered via HidDev_RegisterMonitorCB)
+static hidDevMonConnCB_t monConnCB = NULL;
+static hidDevRssiCB_t    monRssiCB = NULL;
 
 // Status of last pairing
 static uint8_t pairingStatus = SUCCESS;
@@ -104,6 +125,11 @@ static void hidDevProcessGattMsg(gattMsgEvent_t *pMsg);
 static void hidDevProcessGAPMsg(gapRoleEvent_t *pEvent);
 static void hidDevDisconnected(void);
 static void hidDevGapStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent);
+static uint8_t hidMasterUp(void);
+static uint8_t hidMonUp(void);
+static uint8_t hidDevIsSecure(void);
+static void hidDevRssiReadCB(uint16_t connHandle, int8_t newRSSI);
+static void hidDevConnectedAdvertising(void);
 static void hidDevParamUpdateCB(uint16_t connHandle, uint16_t connInterval,
                                 uint16_t connSlaveLatency, uint16_t connTimeout);
 static void hidDevPairStateCB(uint16_t connHandle, uint8_t state, uint8_t status);
@@ -123,14 +149,15 @@ static void    hidDevLowAdvertising(void);
 static void    hidDevInitialAdvertising(void);
 static uint8_t hidDevBondCount(void);
 static uint8_t HidDev_sendNoti(uint16_t handle, uint8_t len, uint8_t *pData);
+static void hidDevClaimMaster(uint16_t connHandle);
 /*********************************************************************
  * PROFILE CALLBACKS
  */
 
 // GAP Role Callbacks
 static gapRolesCBs_t hidDev_PeripheralCBs = {
-    hidDevGapStateCB, // Profile State Change Callbacks
-    NULL,             // When a valid RSSI is read from controller
+    hidDevGapStateCB,   // Profile State Change Callbacks
+    hidDevRssiReadCB,   // When a valid RSSI is read from controller
     hidDevParamUpdateCB
 };
 
@@ -163,16 +190,12 @@ void HidDev_Init()
 {
     hidDevTaskId = TMOS_ProcessEventRegister(HidDev_ProcessEvent);
 
-    // Setup the GAP Bond Manager
-    {
-        uint8_t syncWL = TRUE;
-
-        // If a bond is created, the HID Device should write the address of the
-        // HID Host in the HID Device controller's white list and set the HID
-        // Device controller's advertising filter policy to 'process scan and
-        // connection requests only from devices in the White List'.
-        GAPBondMgr_SetParameter(GAPBOND_AUTO_SYNC_WL, sizeof(uint8_t), &syncWL);
-    }
+    // NOTE: whitelist auto-sync (GAPBOND_AUTO_SYNC_WL) is intentionally NOT
+    // enabled.  With two hosts (PC + Android phone) the phone may rotate its
+    // RPA, and a whitelist-filtered advertiser would silently reject its
+    // connection requests.  Security is enforced per-feature instead:
+    // HID reports need a paired/encrypted master link and the Proximity
+    // Service Control write requires an encrypted link.
 
     // Set up services
     GGS_AddService(GATT_ALL_SERVICES);         // GAP
@@ -240,6 +263,15 @@ uint16_t HidDev_ProcessEvent(uint8_t task_id, uint16_t events)
         return (events ^ BATT_PERIODIC_EVT);
     }
 
+    if(events & PAIR_WINDOW_EVT)
+    {
+        // Pairing window expired: restore whitelist-only filtering
+        uint8_t syncWL = TRUE;
+        GAPBondMgr_SetParameter(GAPBOND_AUTO_SYNC_WL, sizeof(uint8_t), &syncWL);
+
+        return (events ^ PAIR_WINDOW_EVT);
+    }
+
     return 0;
 }
 
@@ -289,18 +321,18 @@ void HidDev_RegisterReports(uint8_t numReports, hidRptMap_t *pRpt)
  */
 uint8_t HidDev_Report(uint8_t id, uint8_t type, uint8_t len, uint8_t *pData)
 {
-    // if connected
-    if(hidDevGapState == GAPROLE_CONNECTED)
+    // if the master (PC) connection is up
+    if(hidMasterUp())
     {
         // if connection is secure
-        if(hidDevConnSecure)
+        if(hidDevIsSecure())
         {
             // send report
             return hidDevSendReport(id, type, len, pData);
         }
     }
-    // else if not already advertising
-    else if(hidDevGapState != GAPROLE_ADVERTISING)
+    // else if not already advertising and no monitor link is up either
+    else if(!hidMonUp() && hidDevGapState != GAPROLE_ADVERTISING)
     {
         // if bonded
         if(hidDevBondCount() > 0)
@@ -329,8 +361,8 @@ void HidDev_Close(void)
 {
     uint8_t param;
 
-    // if connected then disconnect
-    if(hidDevGapState == GAPROLE_CONNECTED)
+    // if the master (PC) connection is up then disconnect it
+    if(hidMasterUp())
     {
         GAPRole_TerminateLink(gapConnHandle);
     }
@@ -365,10 +397,14 @@ bStatus_t HidDev_SetParameter(uint8_t param, uint8_t len, void *pValue)
         case HIDDEV_ERASE_ALLBONDS:
             if(len == 0)
             {
-                // Drop connection
-                if(hidDevGapState == GAPROLE_CONNECTED)
+                // Drop every active connection (master + monitor)
+                if(hidMasterUp())
                 {
                     GAPRole_TerminateLink(gapConnHandle);
+                }
+                if(hidMonUp())
+                {
+                    GAPRole_TerminateLink(monConnHandle);
                 }
 
                 // Erase bonding info
@@ -428,8 +464,12 @@ bStatus_t HidDev_GetParameter(uint8_t param, void *pValue)
  */
 void HidDev_PasscodeRsp(uint8_t status, uint32_t passcode)
 {
+    // Answer on the connection that actually asked for the passcode
+    uint16_t handle = (passcodeConnHandle != GAP_CONNHANDLE_INIT) ?
+                      passcodeConnHandle : gapConnHandle;
+
     // Send passcode response
-    GAPBondMgr_PasscodeRsp(gapConnHandle, status, passcode);
+    GAPBondMgr_PasscodeRsp(handle, status, passcode);
 }
 
 /*********************************************************************
@@ -591,6 +631,16 @@ bStatus_t HidDev_WriteAttrCB(uint16_t connHandle, gattAttribute_t *pAttr,
                 (*pHidDevCB->reportCB)(pRpt->id, pRpt->type, uuid,
                                        (charCfg == GATT_CLIENT_CFG_NOTIFY) ? HID_DEV_OPER_ENABLE : HID_DEV_OPER_DISABLE,
                                        &len, pValue);
+
+                // A true HID host just subscribed to an input report:
+                // let it own the master slot regardless of connect order,
+                // so the PC can still claim the slot when the phone
+                // connected first (and vice versa).
+                if((charCfg == GATT_CLIENT_CFG_NOTIFY) &&
+                   (pRpt->type == HID_REPORT_TYPE_INPUT))
+                {
+                    hidDevClaimMaster(connHandle);
+                }
             }
         }
     }
@@ -605,6 +655,10 @@ bStatus_t HidDev_WriteAttrCB(uint16_t connHandle, gattAttribute_t *pAttr,
 
                 // execute HID app event callback
                 (*pHidDevCB->evtCB)((pValue[0] == HID_PROTOCOL_MODE_BOOT) ? HID_DEV_SET_BOOT_EVT : HID_DEV_SET_REPORT_EVT);
+
+                // Writing the protocol mode is a HID-host action: let this
+                // connection take the master slot (order-independent roles).
+                hidDevClaimMaster(connHandle);
             }
             else
             {
@@ -746,7 +800,7 @@ static void hidDevDisconnected(void)
     hidDevHandleConnStatusCB(gapConnHandle, LINKDB_STATUS_UPDATE_REMOVED);
 
     // Reset state variables
-    hidDevConnSecure = FALSE;
+    secConnHandle = GAP_CONNHANDLE_INIT;
     hidProtocolMode = HID_PROTOCOL_MODE_REPORT;
 
     // if bonded and normally connectable start advertising
@@ -768,34 +822,71 @@ static void hidDevDisconnected(void)
  */
 static void hidDevGapStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
 {
-    uint8_t param;
-    // if connected
-    if(newState == GAPROLE_CONNECTED)
+    // Per-link handling: every link establishment / termination reaches this
+    // callback with its own event, so routing is done by event opcode and
+    // connection handle instead of the global role state.
+    if(pEvent != NULL && pEvent->gap.opcode == GAP_LINK_ESTABLISHED_EVENT)
     {
-        gapEstLinkReqEvent_t *event = (gapEstLinkReqEvent_t *)pEvent;
+        uint16_t newHandle = pEvent->linkCmpl.connectionHandle;
 
-        // get connection handle
-        gapConnHandle = event->connectionHandle;
-
-        // connection not secure yet
-        hidDevConnSecure = FALSE;
-
-        // don't start advertising when connection is closed
-        param = FALSE;
-        GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t), &param);
-    }
-    // if disconnected
-    else if(hidDevGapState == GAPROLE_CONNECTED &&
-            newState != GAPROLE_CONNECTED)
-    {
-        hidDevDisconnected();
-
-        if(pairingStatus == SMP_PAIRING_FAILED_CONFIRM_VALUE)
+        // Only a successful establishment carries a valid handle;
+        // advertising timeout reuses this opcode with a failure status.
+        if(pEvent->gap.hdr.status == SUCCESS && !hidMasterUp())
         {
-            // bonding failed due to mismatched confirm values
-            hidDevInitialAdvertising();
+            // Master slot free -> this link becomes the HID master candidate
+            // (first link in the common PC-first flow).
+            gapConnHandle = newHandle;
+            PRINT("Link est 0x%04x -> MASTER\n", newHandle);
 
-            pairingStatus = SUCCESS;
+            // Keep low-duty advertising alive so the phone can still connect
+            // (multi-connection: we stay connectable while serving the PC).
+            hidDevConnectedAdvertising();
+        }
+        else if(newHandle != gapConnHandle &&
+                (monConnHandle == GAP_CONNHANDLE_INIT || !linkDB_Up(monConnHandle)))
+        {
+            // Master link active -> this is the monitor (phone) link candidate.
+            // It only becomes "active" after the phone writes the Proximity
+            // Service Control characteristic.
+            monConnHandle = newHandle;
+            monActive = FALSE;
+            PRINT("Link est 0x%04x -> MONITOR candidate\n", newHandle);
+
+            if(monConnCB)
+            {
+                monConnCB(HIDDEV_MON_CONN_ESTABLISHED, newHandle);
+            }
+        }
+    }
+    else if(pEvent != NULL && pEvent->gap.opcode == GAP_LINK_TERMINATED_EVENT)
+    {
+        uint16_t termHandle = pEvent->linkTerminate.connectionHandle;
+        PRINT("Link term 0x%04x reason 0x%02x\n", termHandle, pEvent->linkTerminate.reason);
+
+        if(termHandle == gapConnHandle)
+        {
+            // Master (PC) link gone -> original single-link disconnect flow
+            gapConnHandle = GAP_CONNHANDLE_INIT;
+            hidDevDisconnected();
+
+            if(pairingStatus == SMP_PAIRING_FAILED_CONFIRM_VALUE)
+            {
+                // bonding failed due to mismatched confirm values
+                hidDevInitialAdvertising();
+
+                pairingStatus = SUCCESS;
+            }
+        }
+        else if(termHandle == monConnHandle)
+        {
+            // Monitor (phone) link gone -> only notify the proximity module
+            monConnHandle = GAP_CONNHANDLE_INIT;
+            monActive = FALSE;
+
+            if(monConnCB)
+            {
+                monConnCB(HIDDEV_MON_CONN_TERMINATED, termHandle);
+            }
         }
     }
     // if started
@@ -832,6 +923,69 @@ static void hidDevParamUpdateCB(uint16_t connHandle, uint16_t connInterval,
 }
 
 /*********************************************************************
+ * @fn      hidDevClaimMaster
+ *
+ * @brief   Let a connection that performs a genuine HID-host action
+ *          (enabling input report notifications, or writing the HID
+ *          protocol mode) take ownership of the master slot.  Roles are
+ *          then assigned by behaviour instead of connect order:
+ *          - PC connects first  -> PC gets the master slot as usual;
+ *          - phone connects first (and never writes the Proximity
+ *            Control) -> the phone parks in the master slot; when the PC
+ *            connects second it is routed to the monitor slot first, then
+ *            claims the master slot here, demoting the phone to monitor
+ *            candidate.  The phone becomes an active monitor as soon as
+ *            it writes the Control characteristic.
+ *
+ * @return  none
+ */
+static void hidDevClaimMaster(uint16_t connHandle)
+{
+    uint16_t oldMaster;
+
+    // No live link, or it already owns the master slot.
+    if(connHandle == GAP_CONNHANDLE_INIT || !linkDB_Up(connHandle) ||
+       connHandle == gapConnHandle)
+    {
+        return;
+    }
+
+    // Only reshuffle slots when the claimant owns the monitor candidate
+    // slot or the master slot is free; never steal an already established
+    // master/monitor pair.
+    if(connHandle != monConnHandle && hidMasterUp())
+    {
+        return;
+    }
+
+    PRINT("Link 0x%04x claims HID master slot\n", connHandle);
+
+    // Drop the claimant from the monitor slot if it sits there.
+    if(connHandle == monConnHandle)
+    {
+        monConnHandle = GAP_CONNHANDLE_INIT;
+    }
+    monActive = FALSE;
+
+    // Move the previous master (typically a phone that connected first
+    // but never activated) into the monitor candidate slot.
+    oldMaster = gapConnHandle;
+    if(oldMaster != GAP_CONNHANDLE_INIT && linkDB_Up(oldMaster))
+    {
+        monConnHandle = oldMaster;
+    }
+
+    gapConnHandle = connHandle;
+
+    // Reflect the change in the proximity module: the demoted link is now
+    // the monitor candidate and arms itself later via the Control write.
+    if(monConnCB && oldMaster != GAP_CONNHANDLE_INIT && linkDB_Up(oldMaster))
+    {
+        monConnCB(HIDDEV_MON_CONN_ESTABLISHED, oldMaster);
+    }
+}
+
+/*********************************************************************
  * @fn      hidDevPairStateCB
  *
  * @brief   Pairing state callback.
@@ -844,7 +998,7 @@ static void hidDevPairStateCB(uint16_t connHandle, uint8_t state, uint8_t status
     {
         if(status == SUCCESS)
         {
-            hidDevConnSecure = TRUE;
+            secConnHandle = connHandle;
         }
 
         pairingStatus = status;
@@ -853,7 +1007,7 @@ static void hidDevPairStateCB(uint16_t connHandle, uint8_t state, uint8_t status
     {
         if(status == SUCCESS)
         {
-            hidDevConnSecure = TRUE;
+            secConnHandle = connHandle;
 
 #if DEFAULT_SCAN_PARAM_NOTIFY_TEST == TRUE
             ScanParam_RefreshNotify(gapConnHandle);
@@ -880,6 +1034,10 @@ static void hidDevPairStateCB(uint16_t connHandle, uint8_t state, uint8_t status
 static void hidDevPasscodeCB(uint8_t *deviceAddr, uint16_t connectionHandle,
                              uint8_t uiInputs, uint8_t uiOutputs)
 {
+    // Remember which link asked for the passcode so HidDev_PasscodeRsp
+    // answers on the right connection even with two links up.
+    passcodeConnHandle = connectionHandle;
+
     if(pHidDevCB && pHidDevCB->passcodeCB)
     {
         // execute HID app passcode callback
@@ -1177,6 +1335,206 @@ static uint8_t hidDevBondCount(void)
     GAPBondMgr_GetParameter(GAPBOND_BOND_COUNT, &bondCnt);
 
     return (bondCnt);
+}
+
+/*********************************************************************
+ * @fn      hidMasterUp
+ *
+ * @brief   TRUE if the HID master (PC) link is currently connected.
+ */
+static uint8_t hidMasterUp(void)
+{
+    return (gapConnHandle != GAP_CONNHANDLE_INIT) && linkDB_Up(gapConnHandle);
+}
+
+/*********************************************************************
+ * @fn      hidMonUp
+ *
+ * @brief   TRUE if the monitor (phone) link is currently connected.
+ */
+static uint8_t hidMonUp(void)
+{
+    return (monConnHandle != GAP_CONNHANDLE_INIT) && linkDB_Up(monConnHandle);
+}
+
+/*********************************************************************
+ * @fn      hidDevIsSecure
+ *
+ * @brief   TRUE if the master (PC) connection has completed pairing.
+ *          Based on the handle that last bonded, so it stays correct
+ *          even if the master/monitor slots were swapped.
+ */
+static uint8_t hidDevIsSecure(void)
+{
+    return (secConnHandle != GAP_CONNHANDLE_INIT) &&
+           (secConnHandle == gapConnHandle);
+}
+
+/*********************************************************************
+ * @fn      hidDevRssiReadCB
+ *
+ * @brief   GAP role RSSI read callback.  Forwarded to the registered
+ *          proximity callback (connHandle distinguishes the link).
+ */
+static void hidDevRssiReadCB(uint16_t connHandle, int8_t newRSSI)
+{
+    if(monRssiCB)
+    {
+        monRssiCB(connHandle, newRSSI);
+    }
+}
+
+/*********************************************************************
+ * @fn      hidDevConnectedAdvertising
+ *
+ * @brief   Low duty advertising that keeps running while a link is up,
+ *          so the phone can connect at any time (multi-connection).
+ */
+static void hidDevConnectedAdvertising(void)
+{
+    uint8_t param;
+
+    GAP_SetParamValue(TGAP_DISC_ADV_INT_MIN, HID_CONNECTED_ADV_INT);
+    GAP_SetParamValue(TGAP_DISC_ADV_INT_MAX, HID_CONNECTED_ADV_INT);
+
+    param = TRUE;
+    GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t), &param);
+}
+
+/*********************************************************************
+ * @fn      HidDev_RegisterMonitorCB
+ *
+ * @brief   Register proximity callbacks: monitor link events and RSSI.
+ */
+void HidDev_RegisterMonitorCB(hidDevMonConnCB_t connCB, hidDevRssiCB_t rssiCB)
+{
+    monConnCB = connCB;
+    monRssiCB = rssiCB;
+}
+
+/*********************************************************************
+ * @fn      HidDev_MarkMonitorConnection
+ *
+ * @brief   Mark the calling (phone) connection as the monitor link.
+ *          Called from the Proximity Service Control write handler.
+ *          If the phone grabbed the master slot first (it connected
+ *          before the PC), the two slots are swapped so the PC link
+ *          always ends up owning the HID master slot.
+ *
+ * @return  TRUE on success.
+ */
+uint8_t HidDev_MarkMonitorConnection(uint16_t connHandle)
+{
+    if(connHandle == GAP_CONNHANDLE_INIT || !linkDB_Up(connHandle))
+    {
+        return FALSE;
+    }
+
+    if(connHandle == gapConnHandle)
+    {
+        // Phone occupied the master slot: swap the two slots
+        uint16_t tmp = gapConnHandle;
+        gapConnHandle = monConnHandle;
+        monConnHandle = tmp;
+    }
+
+    monActive = TRUE;
+    return TRUE;
+}
+
+/*********************************************************************
+ * @fn      HidDev_DeactivateMonitor
+ *
+ * @brief   Stop judging the monitor link (app wrote Control 0x00 or
+ *          disconnected).  The slot is kept so a re-activate write is
+ *          possible without re-establishing the link.
+ */
+void HidDev_DeactivateMonitor(void)
+{
+    monActive = FALSE;
+}
+
+/*********************************************************************
+ * @fn      HidDev_MonConnActive
+ *
+ * @brief   TRUE if an activated monitor link is currently connected.
+ */
+uint8_t HidDev_MonConnActive(void)
+{
+    return monActive && hidMonUp();
+}
+
+/*********************************************************************
+ * @fn      HidDev_MonConnHandle
+ *
+ * @brief   Current monitor connection handle (may be stale).
+ */
+uint16_t HidDev_MonConnHandle(void)
+{
+    return monConnHandle;
+}
+
+/*********************************************************************
+ * @fn      HidDev_MasterHandle
+ *
+ * @brief   Current HID master (PC) connection handle.
+ */
+uint16_t HidDev_MasterHandle(void)
+{
+    return gapConnHandle;
+}
+
+/*********************************************************************
+ * @fn      HidDev_MasterConnected
+ *
+ * @brief   TRUE if the HID master (PC) link is connected.
+ */
+uint8_t HidDev_MasterConnected(void)
+{
+    return hidMasterUp();
+}
+
+/*********************************************************************
+ * @fn      HidDev_MasterSecure
+ *
+ * @brief   TRUE if the HID master (PC) link is paired/encrypted.
+ */
+uint8_t HidDev_MasterSecure(void)
+{
+    return hidMasterUp() && hidDevIsSecure();
+}
+
+/*********************************************************************
+ * @fn      HidDev_ReadMasterRssi
+ *
+ * @brief   Async RSSI read of the master (PC) link; result arrives in
+ *          the RSSI callback registered via HidDev_RegisterMonitorCB.
+ *
+ * @return  bStatus_t of GAPRole_ReadRssiCmd.
+ */
+bStatus_t HidDev_ReadMasterRssi(void)
+{
+    if(!hidMasterUp())
+    {
+        return bleNotConnected;
+    }
+
+    return GAPRole_ReadRssiCmd(gapConnHandle);
+}
+
+/*********************************************************************
+ * @fn      HidDev_OpenPairingWindow
+ *
+ * @brief   Temporarily disable the bond whitelist filter so a new
+ *          device (e.g. the phone) can pair.  Restored automatically
+ *          after 'seconds' via PAIR_WINDOW_EVT.
+ */
+void HidDev_OpenPairingWindow(uint16_t seconds)
+{
+    uint8_t syncWL = FALSE;
+
+    GAPBondMgr_SetParameter(GAPBOND_AUTO_SYNC_WL, sizeof(uint8_t), &syncWL);
+    tmos_start_task(hidDevTaskId, PAIR_WINDOW_EVT, (uint32_t)seconds * 1600);
 }
 
 /*********************************************************************

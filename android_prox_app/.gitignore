@@ -1,0 +1,23 @@
+# ---- Gradle 构建产物 ----
+.gradle/
+build/
+captures/
+
+# ---- Android Studio / IDE ----
+.idea/
+*.iml
+.kotlin/
+.cxx/
+.externalNativeBuild/
+
+# ---- 本机 SDK 路径（含具体路径，勿入库）----
+local.properties
+
+# ---- 日志 / 临时文件 ----
+*.log
+*.apk
+*.aab
+
+# ---- OS / 编辑器 ----
+.DS_Store
+Thumbs.db

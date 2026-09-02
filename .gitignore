@@ -13,3 +13,14 @@ callgraph.dot
 __pycache__/
 *.py[cod]
 *$py.class
+
+# IDE / 辅助工具本地数据（不入库）
+.codebuddy/
+.marscode/
+
+# 编辑器临时文件
+*.swp
+*~
+
+# MounRiver 本地生成配置
+combo_keyboard/obj/CONFIG.INI

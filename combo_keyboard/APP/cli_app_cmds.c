@@ -114,11 +114,11 @@ static int cmd_info(int argc, char *argv[])
     return 0;
 }
 
-/* --- reset -------------------------------------------------------------- */
-static int cmd_reset(int argc, char *argv[])
+/* --- reboot ------------------------------------------------------------- */
+static int cmd_reboot(int argc, char *argv[])
 {
     (void)argc; (void)argv;
-    cli_print("  System reset in 200ms...\r\n");
+    cli_print("  System reboot in 200ms...\r\n");
     for (volatile uint32_t i = 0; i < 1200000UL; i++) { __NOP(); }
     SYS_ResetExecute();
     return 0;                               /* never reached */
@@ -399,7 +399,7 @@ CLI_CMD_REGISTER("type",    cmd_type,    "type <words...>          HID-type stri
 CLI_CMD_REGISTER("channel", cmd_channel, "channel [ble|usb|both]   set HID output channel");
 CLI_CMD_REGISTER("bond",    cmd_bond,    "bond <clear|count|erase> manage BLE bonding / re-enter pairing");
 CLI_CMD_REGISTER("info",    cmd_info,    "show build / hw / BLE info");
-CLI_CMD_REGISTER("reset",   cmd_reset,   "software reset MCU");
+CLI_CMD_REGISTER("reboot",  cmd_reboot,  "software reboot MCU");
 CLI_CMD_REGISTER("adv",     cmd_adv,     "adv [on|off]             control BLE advertising");
 CLI_CMD_REGISTER("led",     cmd_led,     "led [on|off]             toggle PA13 LED");
 CLI_CMD_REGISTER("baud",    cmd_baud,    "baud <rate>              change CLI UART baudrate");

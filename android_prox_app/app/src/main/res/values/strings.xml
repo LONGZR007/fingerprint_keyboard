@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">键盾 ProxLock</string>
+    <string name="guard_on">守护中</string>
+    <string name="guard_off">未守护</string>
+    <string name="guard_reconnecting">重连中…</string>
+    <string name="device_default">HID Keyboard</string>
+    <string name="state_armed">武装中</string>
+    <string name="state_triggered">已锁屏</string>
+    <string name="state_cooldown">冷却中</string>
+    <string name="state_off">功能关闭</string>
+    <string name="state_unknown">--</string>
+    <string name="btn_start">开始守护</string>
+    <string name="btn_stop">停止守护</string>
+    <string name="hint_keepalive">建议在系统设置中允许本应用「无限制」电池使用并自启动，锁屏/后台才能保持连接。通知栏常驻不可关闭属于正常现象。</string>
+    <string name="hint_pair">首次使用：在设备端串口执行 prox pair 开放 60 秒配对窗口，然后点击右侧按钮到系统蓝牙完成配对。</string>
+    <string name="btn_pair">去系统蓝牙配对</string>
+</resources>

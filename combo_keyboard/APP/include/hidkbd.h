@@ -31,6 +31,7 @@ extern "C" {
 #define START_PARAM_UPDATE_EVT    0x0004
 #define START_PHY_UPDATE_EVT      0x0008
 #define START_TYPE_EVT            0x0010   /* Async string-type state machine */
+#define START_COMBO_EVT           0x0020   /* One-shot modifier+key combo (Win+L) */
 /*********************************************************************
  * MACROS
  */
@@ -75,6 +76,17 @@ extern int  hidkbd_type_busy(void);
  * once the job finishes).
  */
 extern int  hidkbd_type_progress(void);
+
+/*
+ * Schedule a one-shot modifier+keycode combo (e.g. Win+L: modifier=0x08,
+ * keycode=0x0F) on the BLE HID master link.  press -> 100ms -> release,
+ * fully asynchronous (START_COMBO_EVT).  Returns 1 if scheduled, 0 if a
+ * previous combo is still in flight.
+ */
+extern int  hidkbd_send_combo(uint8_t modifier, uint8_t keycode);
+
+/* Query whether a combo press/hold/release sequence is in flight. */
+extern int  hidkbd_combo_busy(void);
 
 /*********************************************************************
 *********************************************************************/

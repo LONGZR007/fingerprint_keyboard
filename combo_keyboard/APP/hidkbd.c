@@ -146,9 +146,9 @@ static uint8_t advertData[] = {
     'e',
     'y',
     'b',
-    'r',
     'o',
     'a',
+    'r',
     'd',  // connection interval range
 };
 
@@ -183,6 +183,12 @@ static uint16_t hidEmuConnHandle = GAP_CONNHANDLE_INIT;
 #define TYPE_STEP_RELEASE    1
 #define TYPE_STEP_NEXT       2
 #define TYPE_TICK_STEP       50   /* 每 step 之间的 tick 间隔 (~1.25ms) */
+
+/* ---- Combo (Win+L style) one-shot sequence ---------------------------- */
+#define COMBO_HOLD_TICKS     160   /* press->release hold: 160 ticks = 100ms */
+static uint8_t s_combo_busy = 0;
+static uint8_t s_combo_mod = 0;
+static uint8_t s_combo_kc  = 0;
 
 /* 预解析的按键序列项: (HID modifier, HID keycode) */
 typedef struct {
@@ -445,6 +451,25 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 break;
         }
         return (events ^ START_TYPE_EVT);
+    }
+
+    /* ---- One-shot combo sequence: press -> hold -> release ---- */
+    if(events & START_COMBO_EVT)
+    {
+        if (!s_combo_busy) {
+            return (events ^ START_COMBO_EVT);
+        }
+        if (s_combo_busy == 1) {
+            /* press */
+            hidEmuSendKbdReport(s_combo_mod, s_combo_kc);
+            s_combo_busy = 2;
+            tmos_start_task(hidEmuTaskId, START_COMBO_EVT, COMBO_HOLD_TICKS);
+        } else {
+            /* release */
+            hidEmuSendKbdReport(0, 0);
+            s_combo_busy = 0;
+        }
+        return (events ^ START_COMBO_EVT);
     }
     return 0;
 }
@@ -739,6 +764,31 @@ int hidkbd_type_progress(void)
     return s_type_typed;
 }
 
+/**********************************************************************
+ * @fn      hidkbd_send_combo
+ *
+ * @brief   Schedule a one-shot modifier+keycode combo (e.g. Win+L) on
+ *          the BLE HID master link: press -> 100ms hold -> release,
+ *          driven by START_COMBO_EVT so the caller never blocks.
+ *
+ * @return  1 if scheduled, 0 if a previous combo is still in flight.
+ *********************************************************************/
+int hidkbd_send_combo(uint8_t modifier, uint8_t keycode)
+{
+    if (s_combo_busy) return 0;
+
+    s_combo_mod  = modifier;
+    s_combo_kc   = keycode;
+    s_combo_busy = 1;
+    tmos_set_event(hidEmuTaskId, START_COMBO_EVT);
+    return 1;
+}
+
+int hidkbd_combo_busy(void)
+{
+    return (int)s_combo_busy;
+}
+
 /*********************************************************************
  * @fn      hidEmuStateCB
  *
@@ -773,10 +823,15 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
             {
                 gapEstLinkReqEvent_t *event = (gapEstLinkReqEvent_t *)pEvent;
 
-                // get connection handle
-                hidEmuConnHandle = event->connectionHandle;
-                tmos_start_task(hidEmuTaskId, START_PARAM_UPDATE_EVT, START_PARAM_UPDATE_EVT_DELAY);
-                PRINT("Connected..\n");
+                // Only react to the HID master (PC) link; the phone monitor
+                // link must not steal the param/PHY update target.
+                if(event->connectionHandle == HidDev_MasterHandle())
+                {
+                    // get connection handle
+                    hidEmuConnHandle = event->connectionHandle;
+                    tmos_start_task(hidEmuTaskId, START_PARAM_UPDATE_EVT, START_PARAM_UPDATE_EVT_DELAY);
+                    PRINT("Connected..\n");
+                }
             }
             break;
 

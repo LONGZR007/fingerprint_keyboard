@@ -5,9 +5,11 @@
  *                      a single async API, with per-channel flags and a
  *                      programmable default channel.
  *******************************************************************************/
+#include "CONFIG.h"
 #include "keyboard_dispatch.h"
 #include "hidkbd.h"
 #include "usb_composite.h"
+#include "hiddev.h"
 
 /* 当前默认通道，上电默认 BLE + USB 同时发送 */
 static kbd_channel_t s_default_channel = KBD_CH_BLE;
@@ -47,6 +49,27 @@ int keyboard_type(const char *text)
 void keyboard_set_channel(kbd_channel_t ch)
 {
     s_default_channel = ch;
+}
+
+int keyboard_send_combo(uint8_t modifier, uint8_t keycode, kbd_channel_t ch)
+{
+    if (ch == KBD_CH_NONE) return 0;
+
+    int scheduled = 0;
+
+    if (ch & KBD_CH_BLE) {
+        /* BLE 只在电脑主连接已配对加密时发送，否则跳过该通道 */
+        if (HidDev_MasterSecure() && hidkbd_send_combo(modifier, keycode) > 0) {
+            scheduled = 1;
+        }
+    }
+    if (ch & KBD_CH_USB) {
+        /* 阻塞式 press/release，内部在主机未轮询时自动放弃 */
+        usb_hid_send_key(modifier, keycode);
+        scheduled = 1;
+    }
+
+    return scheduled;
 }
 
 kbd_channel_t keyboard_get_channel(void)

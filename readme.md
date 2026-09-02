@@ -98,3 +98,76 @@ OBJS   += $(filter-out $(OBJS),$(_cli_objs))
 ## 主工程接入
 
 在 `hidkbd_main.c` 中调用 `Cli_Init()`（内部完成 UART 初始化 + 注册示例命令 + 注册 TMOS 周期任务），TMOS task 回调中调用 `cli_uart_drain()` + `cli_task()`，确保 CLI 处理不阻塞 BLE 协议栈。
+
+# 手机距离监测自动锁屏 (Proximity Lock)
+
+键盘同时维持两条 BLE 连接：电脑（HID 主连接，功能不变）+ 手机（监测连接，
+配 ProxLock Android App）。键盘每 500ms 读手机连接 RSSI，EMA 平滑后，
+低于阈值持续 5s → 自动向电脑发送 Win+L 锁屏；手机回到近处自动重新武装。
+
+## 双连接模型
+
+| 连接 | 角色 | 说明 |
+|------|------|------|
+| 主连接 | 电脑 | HID 键盘报告只走这条；`hiddev.c` 中 `gapConnHandle` 槽位 |
+| 监测连接 | 手机 | App 写 Proximity Service Control 特征 0x01 激活 |
+
+- 手机先连占了主槽位时，写 Control 激活会自动交换两个槽位（保证电脑永远持有主槽）。
+- 主连接建立后广播保持低占空比（1s 间隔）运行，手机随时可连。
+- 配对白名单：`prox pair` 开放 60s 配对窗口（`GAPBOND_AUTO_SYNC_WL` 临时关闭）。
+- `PERIPHERAL_MAX_CONNECTION` 已改为 2（`HAL/include/CONFIG.h`），BLE heap 扩到 7KB。
+
+## 模块与文件
+
+| 文件 | 职责 |
+|------|------|
+| `Profile/hiddev.c/h` | [改] 双连接槽位、按 opcode 分流连接/断开、RSSI 回调挂载、配对窗口 |
+| `APP/proxservice.c/h` | [新] Proximity GATT 服务（Control 写激活 / Status notify RSSI+状态） |
+| `APP/proximity.c/h` | [新] 距离判定状态机（EMA、双阈值迟滞、冷却、Win+L 触发）、DataFlash 配置 |
+| `APP/prox_cli.c` | [新] `rssi` / `prox` CLI 命令 |
+| `APP/hidkbd.c/h` | [改] `hidkbd_send_combo()` 组合键、状态回调按主连接过滤 |
+| `APP/keyboard_dispatch.c/h` | [改] `keyboard_send_combo(mod,key,ch)` 双通道分发 |
+| `android_prox_app/` | [新] ProxLock App（Kotlin+Compose，前台服务保活、自动重连） |
+
+协议契约（App 与固件两端一致）：
+
+```
+Service  a5f5aa00-c263-4a0c-8e8f-9c0b7a5d3e01
+Control  a5f5aa01-...   Write 0x01 激活 / 0x00 停止（要求加密链路）
+Status   a5f5aa02-...   Notify [int8 rssi][state][flags]
+                        state: 0=armed 1=triggered 2=cooldown 3=off
+```
+
+配置存 DataFlash `0x7000`（独立页，用户区 0~6399 与 SNV 之外）。
+
+## 编译
+
+```
+export PATH="$HOME/github/wch/WCHISPTool_CMD/Linux/bin/x64:$PATH"
+export PATH="$HOME/github/wch/MRS_Toolchain_Linux_X64_V240/Toolchain/RISC-V Embedded GCC12/bin:$PATH"
+cd combo_keyboard/obj/
+make clean && make -j8 all
+```
+
+产物：`combo_keyboard.hex`（WCHISPTool 烧录）。
+
+## 联调与校准清单
+
+1. **刷固件**：烧录 `combo_keyboard.hex`，电脑重连键盘，确认打字/指纹/CLI 正常（回归基线）。
+2. **配对手机**：串口执行 `prox pair`（60s 窗口）→ 手机系统蓝牙配对 `HID Keyboard`。
+3. **连接验证**：手机打开 ProxLock → 开始守护 → 显示「守护中 · -xx dBm」；
+   键盘串口 `prox show` 应显示 `monitor: active`，且电脑键盘输入不受影响。
+4. **触发链路**：串口 `prox test` → 电脑应立即锁屏（验证 Win+L + 通道）。
+5. **现场校准**：手机放身上正常姿势，`rssi` 记录典型读数（一般 -60~-70），
+   `prox thr <典型值-8>`；`prox exit` 保持比 `thr` 高 8dB；确认 `prox confirm 5`。
+6. **真机验证**：手机装兜里离开电脑 10m+，约 5~8s 后电脑锁屏；回到工位 App 自动重连，
+   冷却 60s 后回到 armed（App 状态卡显示）。
+7. **回归检查**：BLE 打字、USB 打字、`type` 命令、指纹录入/验证、
+   `bond erase`（会断开所有连接并擦绑表）、广播回连。
+
+## 注意事项
+
+- 电脑断连后设备恢复广播（bonded→低占空比长广播），电脑可随时回连。
+- 手机 App 被系统杀死时默认**不会**触发锁屏（`prox lost 0`）；若需要
+  「失联即锁」语义可 `prox lost 30`（失联 30s 视为离开）。
+- Win+L 通道由 `prox ch` 配置：`auto`（BLE 优先）/`ble`/`usb`/`both`，持久化保存。

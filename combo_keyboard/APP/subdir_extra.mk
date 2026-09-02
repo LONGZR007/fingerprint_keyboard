@@ -4,9 +4,9 @@
 # obj/APP/subdir.mk with the same files already included.
 # Included via makefile.defs (obj/makefile line: -include ../makefile.defs).
 
-_cli_srcs := ../APP/cli.c ../APP/cli_uart.c ../APP/cli_app_cmds.c ../APP/cli_os_compat.c ../APP/usb_composite.c ../APP/keyboard_dispatch.c ../APP/fp_uart.c ../APP/fp_proto.c ../APP/fp_sm.c ../APP/fp_app_cmds.c ../APP/user_flash.c ../APP/user_flash_cli.c
-_cli_deps := ./APP/cli.d ./APP/cli_uart.d ./APP/cli_app_cmds.d ./APP/cli_os_compat.d ./APP/usb_composite.d ./APP/keyboard_dispatch.d ./APP/fp_uart.d ./APP/fp_proto.d ./APP/fp_sm.d ./APP/fp_app_cmds.d ./APP/user_flash.d ./APP/user_flash_cli.d
-_cli_objs := ./APP/cli.o ./APP/cli_uart.o ./APP/cli_app_cmds.o ./APP/cli_os_compat.o ./APP/usb_composite.o ./APP/keyboard_dispatch.o ./APP/fp_uart.o ./APP/fp_proto.o ./APP/fp_sm.o ./APP/fp_app_cmds.o ./APP/user_flash.o ./APP/user_flash_cli.o
+_cli_srcs := ../APP/cli.c ../APP/cli_uart.c ../APP/cli_app_cmds.c ../APP/cli_os_compat.c ../APP/usb_composite.c ../APP/keyboard_dispatch.c ../APP/fp_uart.c ../APP/fp_proto.c ../APP/fp_sm.c ../APP/fp_app_cmds.c ../APP/user_flash.c ../APP/user_flash_cli.c ../APP/proxservice.c ../APP/proximity.c ../APP/prox_cli.c
+_cli_deps := ./APP/cli.d ./APP/cli_uart.d ./APP/cli_app_cmds.d ./APP/cli_os_compat.d ./APP/usb_composite.d ./APP/keyboard_dispatch.d ./APP/fp_uart.d ./APP/fp_proto.d ./APP/fp_sm.d ./APP/fp_app_cmds.d ./APP/user_flash.d ./APP/user_flash_cli.d ./APP/proxservice.d ./APP/proximity.d ./APP/prox_cli.d
+_cli_objs := ./APP/cli.o ./APP/cli_uart.o ./APP/cli_app_cmds.o ./APP/cli_os_compat.o ./APP/usb_composite.o ./APP/keyboard_dispatch.o ./APP/fp_uart.o ./APP/fp_proto.o ./APP/fp_sm.o ./APP/fp_app_cmds.o ./APP/user_flash.o ./APP/user_flash_cli.o ./APP/proxservice.o ./APP/proximity.o ./APP/prox_cli.o
 
 C_SRCS += $(filter-out $(C_SRCS),$(_cli_srcs))
 C_DEPS += $(filter-out $(C_DEPS),$(_cli_deps))

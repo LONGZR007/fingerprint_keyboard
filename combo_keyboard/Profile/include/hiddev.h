@@ -432,6 +432,87 @@ extern bStatus_t HidDev_WriteAttrCB(uint16_t connHandle, gattAttribute_t *pAttr,
                                     uint8_t *pValue, uint16_t len, uint16_t offset, uint8_t method);
 
 /*********************************************************************
+ * Multi-connection (HID master + phone monitor) extension
+ */
+
+// Monitor link event codes (passed to hidDevMonConnCB_t)
+#define HIDDEV_MON_CONN_ESTABLISHED       0x01
+#define HIDDEV_MON_CONN_TERMINATED        0x02
+
+// Monitor link event callback (evt: HIDDEV_MON_CONN_*)
+typedef void (*hidDevMonConnCB_t)(uint8_t evt, uint16_t connHandle);
+
+// RSSI read callback; connHandle distinguishes which link the value is for
+typedef void (*hidDevRssiCB_t)(uint16_t connHandle, int8_t rssi);
+
+/*********************************************************************
+ * @fn      HidDev_RegisterMonitorCB
+ *
+ * @brief   Register proximity callbacks: monitor link events and RSSI
+ *          reads.  Call once from the proximity module init.
+ */
+extern void HidDev_RegisterMonitorCB(hidDevMonConnCB_t connCB, hidDevRssiCB_t rssiCB);
+
+/*********************************************************************
+ * @fn      HidDev_MarkMonitorConnection
+ *
+ * @brief   Mark a connection as the monitor (phone) link.  Called from
+ *          the Proximity Service Control characteristic write handler.
+ *          If the phone grabbed the master slot first, the two slots
+ *          are swapped so the PC link always owns the master slot.
+ *
+ * @return  TRUE on success.
+ */
+extern uint8_t HidDev_MarkMonitorConnection(uint16_t connHandle);
+
+/*********************************************************************
+ * @fn      HidDev_DeactivateMonitor
+ *
+ * @brief   Stop judging the monitor link (app wrote Control 0x00).
+ *          The slot is kept so a later re-activate write works.
+ */
+extern void HidDev_DeactivateMonitor(void);
+
+/*********************************************************************
+ * @fn      HidDev_MonConnActive / HidDev_MonConnHandle
+ *
+ * @brief   Monitor link state: active means the phone wrote the
+ *          Control characteristic AND the link is still up.
+ */
+extern uint8_t  HidDev_MonConnActive(void);
+extern uint16_t HidDev_MonConnHandle(void);
+
+/*********************************************************************
+ * @fn      HidDev_MasterHandle / HidDev_MasterConnected / HidDev_MasterSecure
+ *
+ * @brief   HID master (PC) link accessors.  Secure means paired and
+ *          encrypted, which is required before sending HID reports.
+ */
+extern uint16_t HidDev_MasterHandle(void);
+extern uint8_t  HidDev_MasterConnected(void);
+extern uint8_t  HidDev_MasterSecure(void);
+
+/*********************************************************************
+ * @fn      HidDev_ReadMasterRssi
+ *
+ * @brief   Async RSSI read of the master (PC) link.  The result is
+ *          delivered through the RSSI callback registered with
+ *          HidDev_RegisterMonitorCB.
+ *
+ * @return  bStatus_t (bleNotConnected if the master link is down).
+ */
+extern bStatus_t HidDev_ReadMasterRssi(void);
+
+/*********************************************************************
+ * @fn      HidDev_OpenPairingWindow
+ *
+ * @brief   Temporarily disable the bond whitelist filter so a new
+ *          device (e.g. the phone on first use) can pair.  The
+ *          whitelist is restored automatically after 'seconds'.
+ */
+extern void HidDev_OpenPairingWindow(uint16_t seconds);
+
+/*********************************************************************
 *********************************************************************/
 
 #ifdef __cplusplus

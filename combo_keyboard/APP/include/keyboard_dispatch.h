@@ -35,6 +35,19 @@ int  keyboard_type_text(const char *text, kbd_channel_t ch);
 /* 使用当前默认通道发送（由 keyboard_set_channel 设置）。 */
 int  keyboard_type(const char *text);
 
+/*
+ * 发送一次性组合键（如 Win+L: modifier=0x08, keycode=0x0F），按下保持
+ * 100ms 后释放，异步执行，调用者不阻塞。
+ *
+ * channel 语义：
+ *   KBD_CH_BLE  - 仅 BLE（电脑主连接未配对加密时该通道静默跳过）
+ *   KBD_CH_USB  - 仅 USB
+ *   KBD_CH_BOTH - BLE + USB 同时发（任一通道未就绪不影响另一通道）
+ *
+ * 返回 1 表示至少一个请求通道已接受，0 表示全部未接受。
+ */
+int  keyboard_send_combo(uint8_t modifier, uint8_t keycode, kbd_channel_t ch);
+
 /* 设置 / 获取当前默认发送通道。 */
 void keyboard_set_channel(kbd_channel_t ch);
 kbd_channel_t keyboard_get_channel(void);

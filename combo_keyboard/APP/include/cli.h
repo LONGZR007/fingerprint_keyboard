@@ -13,7 +13,7 @@
 #endif
 
 #ifndef CLI_CMD_MAX
-#define CLI_CMD_MAX     16      /* 动态注册的最大命令数 */
+#define CLI_CMD_MAX     10      /* 动态注册的最大命令数 */
 #endif
 
 #ifndef CLI_PROMPT

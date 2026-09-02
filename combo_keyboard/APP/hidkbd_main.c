@@ -23,11 +23,18 @@
 #include "fp_proto.h"
 #include "fp_sm.h"
 #include "user_flash.h"
+#include "proximity.h"
 
 /*********************************************************************
  * GLOBAL TYPEDEFS
  */
 __attribute__((aligned(4))) uint32_t MEM_BUF[BLE_MEMHEAP_SIZE / 4];
+
+/* 双连接(电脑HID + 手机监测)要求从机最大连接数 >= 2。
+ * 若编译期在这里报错，说明 PERIPHERAL_MAX_CONNECTION 未按 CONFIG.h 生效。 */
+#if PERIPHERAL_MAX_CONNECTION < 2
+#error "PERIPHERAL_MAX_CONNECTION must be >= 2 (see HAL/include/CONFIG.h)"
+#endif
 
 #if(defined(BLE_MAC)) && (BLE_MAC == TRUE)
 const uint8_t MacAddr[6] = {0x84, 0xC2, 0xE4, 0x03, 0x02, 0x02};
@@ -171,6 +178,7 @@ int main(void)
     Cli_Init();
     Fp_Init();               /* 指纹模组驱动初始化 */
     user_flash_init();       /* 用户数据存储模块初始化 (user 命令已由链接器段静态注册) */
+    Prox_Init();             /* 手机距离监测 + 离开自动锁屏 (Win+L) */
     /* USB composite device (HID keyboard + CDC serial) */
     usb_composite_init();
     cli_print("USB composite device initialized.\r\n");
